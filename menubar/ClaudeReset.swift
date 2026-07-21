@@ -263,22 +263,50 @@ final class UsageStore {
 }
 
 // ---- 展示工具 ----
-func sevColor(_ p: Double) -> NSColor {
-    if p >= 90 { return .systemRed }
-    if p >= 70 { return .systemOrange }
+// 颜色按“剩余”算：越少越红
+func remColor(_ rem: Double) -> NSColor {
+    if rem <= 10 { return .systemRed }
+    if rem <= 30 { return .systemOrange }
     return .labelColor
 }
 
-func countdown(_ epoch: Double?) -> String {
+// 菜单里的倒计时："1天8时" / "8时20分" / "45分"
+func shortLeft(_ epoch: Double?) -> String {
     guard let e = epoch else { return "—" }
     var s = Int(e - Date().timeIntervalSince1970)
     if s <= 0 { return "已重置" }
     let d = s / 86400; s %= 86400
     let h = s / 3600;  s %= 3600
     let m = s / 60
-    if d > 0 { return "还剩 \(d)天\(h)时" }
-    if h > 0 { return "还剩 \(h)时\(m)分" }
-    return "还剩 \(m)分"
+    if d > 0 { return h > 0 ? "\(d)天\(h)时" : "\(d)天" }
+    if h > 0 { return "\(h)时\(m)分" }
+    return "\(m)分"
+}
+
+// 菜单栏标题里的极简倒计时："6d" / "8h" / "<1h"
+func tinyLeft(_ epoch: Double?) -> String {
+    guard let e = epoch else { return "?" }
+    let s = Int(e - Date().timeIntervalSince1970)
+    if s <= 0 { return "0" }
+    if s >= 86400 { return "\(s / 86400)d" }
+    if s >= 3600 { return "\(s / 3600)h" }
+    return "<1h"
+}
+
+// 富文本小段
+func seg(_ s: String, _ color: NSColor, _ size: CGFloat, bold: Bool = false, mono: Bool = false) -> NSAttributedString {
+    let font = mono ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
+                    : (bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size))
+    return NSAttributedString(string: s, attributes: [.foregroundColor: color, .font: font])
+}
+
+func shortErr(_ code: String) -> String {
+    switch code {
+    case "http_429":      return "429"
+    case "token_expired": return "Token过期"
+    case "no_token":      return "无凭据"
+    default:              return code
+    }
 }
 
 func resetAt(_ epoch: Double?) -> String {
@@ -335,30 +363,25 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
-    // 菜单栏标题: 每账户一个彩点 + 更紧的那个桶的用量%（Fable 桶带 F 前缀）
+    // 菜单栏标题: 每账户 "●52·1d" —— Fable 剩余% + 距重置时间（周额度和 Fable 同时重置）
     func render() {
         let snaps = store.snapshot()
         let dot: [NSColor] = [.systemGreen, .systemBlue]
         let title = NSMutableAttributedString()
         for (i, s) in snaps.enumerated() {
-            if i > 0 { title.append(NSAttributedString(string: "  ")) }
-            title.append(NSAttributedString(string: "● ", attributes: [
-                .foregroundColor: dot[i % dot.count],
-                .font: NSFont.systemFont(ofSize: 9)]))
-            let w = s.weekly?.pct, f = s.fable?.pct
-            let txt: String; var col: NSColor
-            if w == nil && f == nil {
-                txt = s.error != nil ? "!" : "—"
-                col = s.error != nil ? .systemRed : .secondaryLabelColor
-            } else if (f ?? -1) >= (w ?? -1) {
-                txt = "F\(Int(f!))%"; col = sevColor(f!)
+            if i > 0 { title.append(NSAttributedString(string: " ")) }
+            title.append(seg("●", dot[i % dot.count], 8))
+            let p = s.fable?.pct ?? s.weekly?.pct   // 没有 Fable 桶时退回周限额
+            if let p = p {
+                let rem = max(0, 100 - Int(p))
+                let col: NSColor = s.error != nil ? .systemOrange : remColor(Double(rem))  // 橙=降级旧数据
+                title.append(seg("\(rem)", col, 12, mono: true))
+                title.append(seg("·\(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
+                                 .secondaryLabelColor, 10, mono: true))
             } else {
-                txt = "\(Int(w!))%"; col = sevColor(w!)
+                title.append(seg(s.error != nil ? "!" : "—",
+                                 s.error != nil ? .systemRed : .secondaryLabelColor, 12))
             }
-            if s.error != nil && (w != nil || f != nil) { col = .systemOrange }  // 降级：显示旧数据
-            title.append(NSAttributedString(string: txt, attributes: [
-                .foregroundColor: col,
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)]))
         }
         statusItem.button?.attributedTitle = title
         rebuildMenu(snaps)
@@ -368,72 +391,52 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mi = NSMenuItem(); mi.attributedTitle = s; mi.isEnabled = true; return mi
     }
 
+    // 每账户一行："● B 在用  Fable剩52% · 周剩68% · 1天8时后重置 (07-23 07:00)"
     func rebuildMenu(_ snaps: [AcctSnap]) {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
-        let dim: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.secondaryLabelColor,
-                                                  .font: NSFont.systemFont(ofSize: 12)]
         let dotCol: [NSColor] = [.systemGreen, .systemBlue]
 
         for (i, s) in snaps.enumerated() {
-            let head = NSMutableAttributedString()
-            head.append(NSAttributedString(string: "● ", attributes: [.foregroundColor: dotCol[i % dotCol.count]]))
-            head.append(NSAttributedString(string: "账户 \(s.cfg.label)  ", attributes:
-                [.font: NSFont.boldSystemFont(ofSize: 13)]))
-            head.append(NSAttributedString(string: s.cfg.email, attributes: dim))
-            if s.active {
-                head.append(NSAttributedString(string: "  ● 在用", attributes:
-                    [.foregroundColor: NSColor.systemGreen, .font: NSFont.systemFont(ofSize: 11)]))
-            }
-            menu.addItem(infoItem(head))
+            let line = NSMutableAttributedString()
+            line.append(seg("● ", dotCol[i % dotCol.count], 12))
+            line.append(seg(s.cfg.label, .labelColor, 13, bold: true))
+            if s.active { line.append(seg(" 在用", .systemGreen, 10)) }
+            line.append(seg("  ", .labelColor, 12))
 
             if s.weekly == nil && s.fable == nil {
-                let msg = s.error.map(errText) ?? "暂无数据"
-                menu.addItem(infoItem(NSAttributedString(string: "   " + msg,
-                    attributes: [.foregroundColor: NSColor.systemRed, .font: NSFont.systemFont(ofSize: 12)])))
+                line.append(seg(s.error.map(errText) ?? "暂无数据", .systemRed, 12))
             } else {
-                menu.addItem(infoItem(row("周限额", s.weekly)))
-                menu.addItem(infoItem(row("Fable ", s.fable)))
-                if let e = s.error, let at = s.dataAt {
-                    var msg = "   ⚠ \(errText(e)) · 显示 \(ageText(-at.timeIntervalSinceNow))的数据"
+                func remSegs(_ name: String, _ b: Block?) {
+                    line.append(seg(name, .secondaryLabelColor, 12))
+                    guard let p = b?.pct else { line.append(seg("—", .tertiaryLabelColor, 12)); return }
+                    let rem = max(0, 100 - Int(p))
+                    line.append(seg("\(rem)%", remColor(Double(rem)), 13, bold: true, mono: true))
+                }
+                remSegs("Fable剩", s.fable)
+                line.append(seg(" · ", .tertiaryLabelColor, 12))
+                remSegs("周剩", s.weekly)
+                let ep = s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch
+                line.append(seg(" · \(shortLeft(ep))后重置", .labelColor, 12))
+                line.append(seg(" (\(resetAt(ep)))", .secondaryLabelColor, 11))
+                if let e = s.error {
+                    var w = " ⚠\(shortErr(e))"
+                    if let at = s.dataAt { w += "·缓存\(ageText(-at.timeIntervalSinceNow))" }
                     let wait = s.notBefore.timeIntervalSinceNow
-                    if wait > 0 { msg += " · \(Int(wait / 60) + 1) 分后重试" }
-                    menu.addItem(infoItem(NSAttributedString(string: msg,
-                        attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 11)])))
+                    if wait > 0 { w += "·\(Int(wait / 60) + 1)分后重试" }
+                    line.append(seg(w, .systemOrange, 10))
                 }
             }
-            if i < snaps.count - 1 { menu.addItem(.separator()) }
+            menu.addItem(infoItem(line))
         }
 
         menu.addItem(.separator())
         if let age = store.dataAge() {
-            menu.addItem(infoItem(NSAttributedString(
-                string: "数据更新于 \(ageText(age)) · 每 \(Int(POLL_SEC / 60)) 分钟轮流拉取一个账户",
-                attributes: [.foregroundColor: NSColor.tertiaryLabelColor, .font: NSFont.systemFont(ofSize: 11)])))
+            menu.addItem(infoItem(seg("更新于 \(ageText(age)) · 后台每小时轮询一次/账户",
+                                      .tertiaryLabelColor, 11)))
         }
         add(menu, "立即刷新", #selector(doRefresh), "r")
         add(menu, "退出", #selector(quit), "q")
-    }
-
-    // "周限额   40%   还剩 2天3时 · 07-24 08:00"  /  "剩 X%" 直接回答“还剩多少”
-    func row(_ name: String, _ b: Block?) -> NSAttributedString {
-        let out = NSMutableAttributedString()
-        out.append(NSAttributedString(string: "   \(name)   ", attributes:
-            [.foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.systemFont(ofSize: 12)]))
-        guard let b = b, b.pct != nil || b.resetsEpoch != nil else {
-            out.append(NSAttributedString(string: "无数据", attributes:
-                [.foregroundColor: NSColor.tertiaryLabelColor, .font: NSFont.systemFont(ofSize: 12)]))
-            return out
-        }
-        let pct = b.pct ?? 0
-        out.append(NSAttributedString(string: "剩 \(max(0, 100 - Int(pct)))%",
-            attributes: [.foregroundColor: sevColor(pct),
-                         .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold)]))
-        out.append(NSAttributedString(string: "  " + countdown(b.resetsEpoch), attributes:
-            [.foregroundColor: NSColor.labelColor, .font: NSFont.systemFont(ofSize: 12)]))
-        out.append(NSAttributedString(string: "  · " + resetAt(b.resetsEpoch), attributes:
-            [.foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.systemFont(ofSize: 11)]))
-        return out
     }
 
     func add(_ menu: NSMenu, _ t: String, _ sel: Selector, _ key: String) {
