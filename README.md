@@ -1,0 +1,37 @@
+# claude-reset
+
+macOS 菜单栏小组件：监控两个 Claude 账户的**周限额**和 **Fable 周容量**（用量 % + 重置倒计时）。无后端、无依赖，一个 Swift 文件编译成单二进制。
+
+菜单栏显示每个账户更紧的那个额度（Fable 桶带 `F` 前缀），点开看详情：
+
+```
+● 账户 B  account-b@example.com  ● 在用
+   周限额   剩 71%   还剩 1天3时 · 07-22 23:59
+   Fable    剩 58%   还剩 1天3时 · 07-22 23:59
+```
+
+## 工作方式
+
+- 从 macOS 钥匙串**只读**取两个账户的 Claude Code OAuth token（绝不刷新，不会把 Claude Code 挤下线）
+- 每 2 分钟调一次 `api.anthropic.com/api/oauth/usage`；打开菜单、手动刷新都有节流，不会放大请求
+- 周限额取 `limits[]` 里 `kind=weekly_all`，Fable 取 `kind=weekly_scoped`（`scope.model.display_name=Fable`）
+- 429 时读 `Retry-After` + 指数退避（最多 30 分钟）；失败期间继续显示上次数据（橙色降级），不清空
+- 快照落盘 `state.json`，重启立刻有数据
+
+## 安装
+
+```bash
+./install.sh
+```
+
+编译后装到 `~/Library/Application Support/claude-reset/` 并注册 LaunchAgent（登录自启）。运行时文件不放仓库目录（Desktop 是 TCC 保护路径，launchd 后台进程在里面读写不稳）。
+
+账户配置在 `menubar/ClaudeReset.swift` 顶部 `ACCOUNTS`；keychain service 名用 `security dump-keychain | grep 'Claude Code-credentials'` 查。当前在用账户的标记读 `~/.claude-current-acct`（内容 `a` 或 `b`）。
+
+## 卸载
+
+```bash
+launchctl bootout gui/$(id -u)/com.yifan.claude-reset-menubar
+rm ~/Library/LaunchAgents/com.yifan.claude-reset-menubar.plist
+rm -rf ~/Library/Application\ Support/claude-reset
+```

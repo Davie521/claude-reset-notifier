@@ -1,0 +1,4 @@
+menubar/claude-reset-menubar
+state.json
+*.log
+.DS_Store
