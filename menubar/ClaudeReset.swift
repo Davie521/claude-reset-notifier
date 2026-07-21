@@ -331,6 +331,89 @@ func errText(_ code: String) -> String {
     }
 }
 
+// ---- 菜单账户行（自绘视图：容量条 + 倒计时，系统语义色自动适配深浅色） ----
+final class AccountRowView: NSView {
+    private let snap: AcctSnap
+    private let dotColor: NSColor
+
+    init(snap: AcctSnap, dotColor: NSColor) {
+        self.snap = snap
+        self.dotColor = dotColor
+        super.init(frame: NSRect(x: 0, y: 0, width: 336, height: 48))
+    }
+    required init?(coder: NSCoder) { fatalError("unused") }
+    override var isFlipped: Bool { true }
+
+    // 容量条填充色：剩得越少越警示
+    private func barColor(_ rem: Double) -> NSColor {
+        if rem <= 10 { return .systemRed }
+        if rem <= 30 { return .systemOrange }
+        return .systemGreen
+    }
+
+    @discardableResult
+    private func put(_ a: NSAttributedString, _ x: CGFloat, _ y: CGFloat) -> CGFloat {
+        a.draw(at: NSPoint(x: x, y: y))
+        return x + a.size().width
+    }
+
+    // "Fable ▬▬▬▬▬░░ 52%"，返回结束 x
+    private func drawGauge(_ name: String, _ b: Block?, _ x0: CGFloat) -> CGFloat {
+        var x = put(seg(name, .secondaryLabelColor, 11), x0, 27)
+        x += 7
+        guard let p = b?.pct else { return put(seg("—", .tertiaryLabelColor, 11), x, 27) }
+        let rem = max(0.0, min(100.0, 100.0 - p))
+        let barW: CGFloat = 74
+        NSColor.quaternaryLabelColor.setFill()
+        NSBezierPath(roundedRect: NSRect(x: x, y: 32, width: barW, height: 4), xRadius: 2, yRadius: 2).fill()
+        let fw = barW * CGFloat(rem) / 100
+        if fw >= 1 {
+            barColor(rem).setFill()
+            NSBezierPath(roundedRect: NSRect(x: x, y: 32, width: fw, height: 4), xRadius: 2, yRadius: 2).fill()
+        }
+        x += barW + 7
+        return put(seg("\(Int(rem))%", .labelColor, 12, bold: true, mono: true), x, 25)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let L: CGFloat = 14, R = bounds.width - 14
+
+        // 第一行：身份点 + 账户名 + 在用徽章 | 右对齐：距重置 + 日期 (+降级标记)
+        dotColor.setFill()
+        NSBezierPath(ovalIn: NSRect(x: L, y: 10, width: 7, height: 7)).fill()
+        var x = put(seg(snap.cfg.label, .labelColor, 13, bold: true), L + 13, 5)
+        if snap.active {
+            let t = seg("在用", .systemGreen, 9, bold: true)
+            let badge = NSRect(x: x + 6, y: 6, width: t.size().width + 10, height: 14)
+            NSColor.systemGreen.withAlphaComponent(0.16).setFill()
+            NSBezierPath(roundedRect: badge, xRadius: 7, yRadius: 7).fill()
+            put(t, badge.minX + 5, 8)
+            x = badge.maxX
+        }
+        let hasData = snap.weekly != nil || snap.fable != nil
+        let right = NSMutableAttributedString()
+        if hasData {
+            let ep = snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch
+            right.append(seg("\(shortLeft(ep))后重置", .labelColor, 12, mono: true))
+            right.append(seg("  \(resetAt(ep))", .tertiaryLabelColor, 10, mono: true))
+        }
+        if let e = snap.error {
+            var w = "  ⚠\(shortErr(e))"
+            if hasData, let at = snap.dataAt { w += "·\(ageText(-at.timeIntervalSinceNow))" }
+            right.append(seg(w, .systemOrange, 10))
+        }
+        put(right, R - right.size().width, 6)
+
+        // 第二行：两个容量条
+        if hasData {
+            let end = drawGauge("Fable", snap.fable, L)
+            _ = drawGauge("周", snap.weekly, end + 20)
+        } else {
+            put(seg(snap.error.map(errText) ?? "暂无数据", .systemRed, 12), L, 26)
+        }
+    }
+}
+
 // ---- App ----
 class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
@@ -391,43 +474,16 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mi = NSMenuItem(); mi.attributedTitle = s; mi.isEnabled = true; return mi
     }
 
-    // 每账户一行："● B 在用  Fable剩52% · 周剩68% · 1天8时后重置 (07-23 07:00)"
+    // 每账户一个自绘视图行（容量条 + 倒计时）
     func rebuildMenu(_ snaps: [AcctSnap]) {
         guard let menu = statusItem.menu else { return }
         menu.removeAllItems()
         let dotCol: [NSColor] = [.systemGreen, .systemBlue]
 
         for (i, s) in snaps.enumerated() {
-            let line = NSMutableAttributedString()
-            line.append(seg("● ", dotCol[i % dotCol.count], 12))
-            line.append(seg(s.cfg.label, .labelColor, 13, bold: true))
-            if s.active { line.append(seg(" 在用", .systemGreen, 10)) }
-            line.append(seg("  ", .labelColor, 12))
-
-            if s.weekly == nil && s.fable == nil {
-                line.append(seg(s.error.map(errText) ?? "暂无数据", .systemRed, 12))
-            } else {
-                func remSegs(_ name: String, _ b: Block?) {
-                    line.append(seg(name, .secondaryLabelColor, 12))
-                    guard let p = b?.pct else { line.append(seg("—", .tertiaryLabelColor, 12)); return }
-                    let rem = max(0, 100 - Int(p))
-                    line.append(seg("\(rem)%", remColor(Double(rem)), 13, bold: true, mono: true))
-                }
-                remSegs("Fable剩", s.fable)
-                line.append(seg(" · ", .tertiaryLabelColor, 12))
-                remSegs("周剩", s.weekly)
-                let ep = s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch
-                line.append(seg(" · \(shortLeft(ep))后重置", .labelColor, 12))
-                line.append(seg(" (\(resetAt(ep)))", .secondaryLabelColor, 11))
-                if let e = s.error {
-                    var w = " ⚠\(shortErr(e))"
-                    if let at = s.dataAt { w += "·缓存\(ageText(-at.timeIntervalSinceNow))" }
-                    let wait = s.notBefore.timeIntervalSinceNow
-                    if wait > 0 { w += "·\(Int(wait / 60) + 1)分后重试" }
-                    line.append(seg(w, .systemOrange, 10))
-                }
-            }
-            menu.addItem(infoItem(line))
+            let item = NSMenuItem()
+            item.view = AccountRowView(snap: s, dotColor: dotCol[i % dotCol.count])
+            menu.addItem(item)
         }
 
         menu.addItem(.separator())
