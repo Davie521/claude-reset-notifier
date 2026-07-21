@@ -13,9 +13,9 @@ macOS 菜单栏小组件：监控两个 Claude 账户的**周限额**和 **Fable
 ## 工作方式
 
 - 从 macOS 钥匙串**只读**取两个账户的 Claude Code OAuth token（绝不刷新，不会把 Claude Code 挤下线）
-- 每 2 分钟调一次 `api.anthropic.com/api/oauth/usage`；打开菜单、手动刷新都有节流，不会放大请求
+- 背景轮询极懒：每 30 分钟调一次 `api.anthropic.com/api/oauth/usage`，且每次只拉一个账户、两账户轮流（单账户 1 小时一次）。这个接口限流极紧——实测持续每分钟 1 个请求都会 429，频率宁低勿高。体感不钝：打开菜单时数据超过 3 分钟旧会即时补拉一次，手动刷新也有节流
 - 周限额取 `limits[]` 里 `kind=weekly_all`，Fable 取 `kind=weekly_scoped`（`scope.model.display_name=Fable`）
-- 429 时读 `Retry-After` + 指数退避（最多 30 分钟）；失败期间继续显示上次数据（橙色降级），不清空
+- 429 按账户独立退避：max(`Retry-After`, 5→10→20…分钟，上限 1 小时) + 60 秒全局冷却，一个账户被限流不影响另一个更新；失败期间继续显示上次数据（橙色降级），不清空
 - 快照落盘 `state.json`，重启立刻有数据
 
 ## 安装

@@ -2,8 +2,11 @@
 // 一个菜单栏 App 干完所有事：读钥匙串 → 拉 Anthropic 用量 → 菜单栏展示。
 // 只关注两件事：周限额(用量+重置时间) 和 Fable 周容量(用量+重置时间)。
 // robust 设计：
-//   - 上游只由一个 120s 定时循环访问，打开菜单/手动刷新都有节流，不会放大请求
-//   - 429 读 Retry-After + 指数退避(2→4→8→…最多30分钟)
+//   - 背景轮询极懒：每 30 分钟只拉一个账户，两账户轮流（单账户 1 小时一次）；
+//     打开菜单时数据超过 3 分钟旧才即时补拉一次，手动刷新也有节流
+//     （usage 接口限流极紧：实测持续 1 请求/分钟仍会 429，务必保持低频）
+//   - 429 按账户独立退避：max(Retry-After, 5→10→20…分钟, 上限1小时)，另有 60s 全局冷却；
+//     一个账户被限流不冻结另一个账户的更新
 //   - 拉取失败时继续显示上次成功的数据(橙色降级标记)，而不是报错清空
 //   - 快照落盘到二进制同目录 state.json，重启后立刻有数据
 // 安装: 仓库根目录跑 ./install.sh（编译 + 装到 ~/Library/Application Support/claude-reset + 注册 LaunchAgent）
@@ -17,9 +20,11 @@ let ACCOUNTS = [
 ]
 let USAGE_URL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let BETA_HEADER = "oauth-2025-04-20"
-let POLL_SEC: TimeInterval = 120        // 上游拉取节奏（唯一会打上游的地方）
-let MENU_STALE_SEC: TimeInterval = 60   // 打开菜单时数据比这旧才顺带触发一次刷新
-let FORCE_MIN_GAP: TimeInterval = 15    // 手动“立即刷新”最小间隔
+let POLL_SEC: TimeInterval = 1800       // 定时节奏：每 tick 只拉一个账户，两账户轮流（单账户 1 小时一次）
+                                        // 周额度是慢变量，背景轮询宁懒勿勤；打开菜单时数据过旧会即时补拉
+let MENU_STALE_SEC: TimeInterval = 180  // 打开菜单时最旧账户数据比这旧才顺带触发一次拉取
+let FORCE_MIN_GAP: TimeInterval = 30    // 手动“立即刷新”最小间隔
+let TICK_MIN_GAP: TimeInterval = 15     // 自动拉取去重间隔（定时器与菜单打开撞车时）
 let HOME = FileManager.default.homeDirectoryForCurrentUser
 let CURRENT_ACCT_FILE = HOME.appendingPathComponent(".claude-current-acct")
 // 状态文件放二进制同目录（安装后即 Application Support），源码仓库保持干净
@@ -61,6 +66,8 @@ struct AcctSnap {
     var weekly: Block?       // 周限额(全模型)
     var fable: Block?        // Fable 周容量
     var dataAt: Date?        // 数据成功拉到的时间
+    var notBefore = Date.distantPast   // 该账户的 429 退避闸门
+    var backoff: TimeInterval = 0
 }
 
 final class Ref<T> { var v: T; init(_ v: T) { self.v = v } }
@@ -73,8 +80,7 @@ final class UsageStore {
     private var snaps: [AcctSnap]
     private var refreshing = false
     private var lastAttempt = Date.distantPast
-    private var notBefore = Date.distantPast             // 429 退避闸门
-    private var backoff: TimeInterval = 0
+    private var globalCooldown = Date.distantPast        // 任一账户 429 后的短全局冷却
     var onUpdate: (() -> Void)?                          // 主线程回调
 
     private init() {
@@ -99,66 +105,68 @@ final class UsageStore {
         return out
     }
 
-    func backoffRemaining() -> TimeInterval? {
-        var t: TimeInterval?
-        stateQ.sync { if notBefore > Date() { t = notBefore.timeIntervalSinceNow } }
-        return t
-    }
-
+    // 数据最新的账户的年龄（给页脚显示）
     func dataAge() -> TimeInterval? {
         var newest: Date?
         stateQ.sync { newest = snaps.compactMap { $0.dataAt }.max() }
         return newest.map { -$0.timeIntervalSinceNow }
     }
 
-    func refresh(force: Bool = false) {
-        let now = Date()
-        var go = false
+    // 数据最旧的账户的年龄（给菜单打开时判断要不要顺带拉一次）
+    func stalestAge() -> TimeInterval {
+        var oldest: Date?
         stateQ.sync {
-            if refreshing { return }
-            if now.timeIntervalSince(lastAttempt) < FORCE_MIN_GAP { return }
-            if !force && now < notBefore { return }
-            refreshing = true; lastAttempt = now; go = true
+            if snaps.contains(where: { $0.dataAt == nil }) { oldest = nil }
+            else { oldest = snaps.compactMap { $0.dataAt }.min() }
         }
-        guard go else { return }
-        workQ.async { self.doRefresh() }
+        return oldest.map { -$0.timeIntervalSinceNow } ?? .infinity
     }
 
-    private func doRefresh() {
-        let group = DispatchGroup()
-        let resQ = DispatchQueue(label: "res")
-        var results = [String: (Block?, Block?, String?, Double?)]()  // id -> (weekly, fable, err, retryAfter)
-        for cfg in ACCOUNTS {
-            group.enter()
-            DispatchQueue.global().async {
-                let r = Self.fetchAccount(cfg)
-                resQ.sync { results[cfg.id] = r }
-                group.leave()
-            }
-        }
-        group.wait()
+    // 一个 tick 只拉一个账户（数据最旧且已过退避期的那个）；force=手动刷新，全拉且无视退避
+    func tick(force: Bool = false) {
         let now = Date()
-        var rateLimited: Double?
+        var targets: [Int] = []
         stateQ.sync {
-            for i in snaps.indices {
-                guard let r = results[snaps[i].cfg.id] else { continue }
+            if refreshing { return }
+            if now.timeIntervalSince(lastAttempt) < (force ? FORCE_MIN_GAP : TICK_MIN_GAP) { return }
+            if force {
+                targets = Array(snaps.indices)
+            } else {
+                if now < globalCooldown { return }
+                let eligible = snaps.indices.filter { now >= snaps[$0].notBefore }
+                guard let pick = eligible.min(by: {
+                    (snaps[$0].dataAt ?? .distantPast) < (snaps[$1].dataAt ?? .distantPast)
+                }) else { return }
+                targets = [pick]
+            }
+            refreshing = true; lastAttempt = now
+        }
+        guard !targets.isEmpty else { return }
+        workQ.async { self.doRefresh(targets) }
+    }
+
+    private func doRefresh(_ idxs: [Int]) {
+        var results = [Int: (Block?, Block?, String?, Double?)]()  // idx -> (weekly, fable, err, retryAfter)
+        for i in idxs { results[i] = Self.fetchAccount(ACCOUNTS[i]) }  // 串行，避免同瞬间双请求
+        let now = Date()
+        stateQ.sync {
+            for (i, r) in results {
                 if let err = r.2 {
                     snaps[i].error = err
-                    if err == "http_429" { rateLimited = max(rateLimited ?? 0, r.3 ?? 0) }
+                    if err == "http_429" {
+                        snaps[i].backoff = snaps[i].backoff == 0 ? 300 : min(snaps[i].backoff * 2, 3600)
+                        if let ra = r.3 { snaps[i].backoff = min(max(snaps[i].backoff, ra), 3600) }
+                        snaps[i].notBefore = now.addingTimeInterval(snaps[i].backoff)
+                        globalCooldown = max(globalCooldown, now.addingTimeInterval(60))
+                    }
                 } else {
                     snaps[i].error = nil
+                    snaps[i].backoff = 0
+                    snaps[i].notBefore = .distantPast
                     snaps[i].weekly = r.0
                     snaps[i].fable = r.1
                     snaps[i].dataAt = now
                 }
-            }
-            if let ra = rateLimited {
-                backoff = backoff == 0 ? 120 : min(backoff * 2, 1800)
-                if ra > backoff { backoff = min(ra, 3600) }
-                notBefore = now.addingTimeInterval(backoff)
-            } else {
-                backoff = 0
-                notBefore = .distantPast
             }
             refreshing = false
         }
@@ -309,17 +317,21 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         store.onUpdate = { [weak self] in self?.render() }
-        store.refresh()
+        store.tick()
         render()
+        // 启动预热：45 秒后错峰拉另一个账户（tick 自动挑数据最旧的），不和首次拉取挤在同一瞬间
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) { [weak self] in
+            self?.store.tick()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: POLL_SEC, repeats: true) { [weak self] _ in
-            self?.store.refresh()
-            self?.render()   // 即便被退避拦下也刷新一下界面上的时间显示
+            self?.store.tick()
+            self?.render()   // 即便这轮没拉数据也刷新一下界面上的时间显示
         }
         timer?.tolerance = 10
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        if (store.dataAge() ?? .infinity) > MENU_STALE_SEC { store.refresh() }
+        if store.stalestAge() > MENU_STALE_SEC { store.tick() }
         render()
     }
 
@@ -383,8 +395,10 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 menu.addItem(infoItem(row("周限额", s.weekly)))
                 menu.addItem(infoItem(row("Fable ", s.fable)))
                 if let e = s.error, let at = s.dataAt {
-                    menu.addItem(infoItem(NSAttributedString(
-                        string: "   ⚠ \(errText(e)) · 显示 \(ageText(-at.timeIntervalSinceNow))的数据",
+                    var msg = "   ⚠ \(errText(e)) · 显示 \(ageText(-at.timeIntervalSinceNow))的数据"
+                    let wait = s.notBefore.timeIntervalSinceNow
+                    if wait > 0 { msg += " · \(Int(wait / 60) + 1) 分后重试" }
+                    menu.addItem(infoItem(NSAttributedString(string: msg,
                         attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 11)])))
                 }
             }
@@ -392,14 +406,9 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        if let left = store.backoffRemaining() {
-            menu.addItem(infoItem(NSAttributedString(
-                string: "上游限流中 · \(Int(left / 60) + 1) 分钟后自动重试",
-                attributes: [.foregroundColor: NSColor.systemOrange, .font: NSFont.systemFont(ofSize: 11)])))
-        }
         if let age = store.dataAge() {
             menu.addItem(infoItem(NSAttributedString(
-                string: "数据更新于 \(ageText(age)) · 每 \(Int(POLL_SEC / 60)) 分钟拉取",
+                string: "数据更新于 \(ageText(age)) · 每 \(Int(POLL_SEC / 60)) 分钟轮流拉取一个账户",
                 attributes: [.foregroundColor: NSColor.tertiaryLabelColor, .font: NSFont.systemFont(ofSize: 11)])))
         }
         add(menu, "立即刷新", #selector(doRefresh), "r")
@@ -432,7 +441,7 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mi.target = self; mi.isEnabled = true; menu.addItem(mi)
     }
 
-    @objc func doRefresh() { store.refresh(force: true) }
+    @objc func doRefresh() { store.tick(force: true) }
     @objc func quit() { NSApp.terminate(nil) }
 }
 
