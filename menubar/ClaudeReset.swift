@@ -457,16 +457,16 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 菜单栏标题: 每账户 = 余量圆环(图形) + 距重置时间(文字主角)，如 "◔ 5d  ◑ 21h"
-    // 环填充比例 = Fable 剩余；环色 = 账户识别色(A绿/B蓝)，剩≤30% 橙、≤10% 红
+    // 环默认单色 labelColor（菜单栏惯例：壁纸把栏染成什么色都清晰），左 A 右 B 靠位置区分；
+    // 颜色只在有含义时出现：剩≤30% 橙、≤10% 红
     func render() {
         let snaps = store.snapshot()
-        let dot: [NSColor] = [.systemGreen, .systemBlue]
         let title = NSMutableAttributedString()
         for (i, s) in snaps.enumerated() {
             if i > 0 { title.append(NSAttributedString(string: "  ")) }
             let p = s.fable?.pct ?? s.weekly?.pct   // 没有 Fable 桶时退回周限额
             let rem = p.map { max(0.0, min(100.0, 100.0 - $0)) }
-            var ringCol = dot[i % dot.count]
+            var ringCol = NSColor.labelColor
             if let r = rem, r <= 30 { ringCol = r <= 10 ? .systemRed : .systemOrange }
             let att = NSTextAttachment()
             att.image = ringImage(frac: (rem ?? 0) / 100.0, color: ringCol)
