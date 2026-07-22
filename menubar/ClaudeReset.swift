@@ -372,7 +372,7 @@ final class AccountRowView: NSView {
             NSBezierPath(roundedRect: NSRect(x: x, y: 32, width: fw, height: 4), xRadius: 2, yRadius: 2).fill()
         }
         x += barW + 7
-        return put(seg("\(Int(rem))%", .labelColor, 12, bold: true, mono: true), x, 25)
+        return put(seg("剩\(Int(rem))%", .labelColor, 12, bold: true, mono: true), x, 25)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -458,7 +458,7 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if let p = p {
                 let rem = max(0, 100 - Int(p))
                 let col: NSColor = s.error != nil ? .systemOrange : remColor(Double(rem))  // 橙=降级旧数据
-                title.append(seg("\(rem)", col, 12, mono: true))
+                title.append(seg("剩\(rem)", col, 12, mono: true))
                 title.append(seg("·\(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
                                  .secondaryLabelColor, 10, mono: true))
             } else {
