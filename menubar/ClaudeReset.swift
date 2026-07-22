@@ -365,7 +365,7 @@ final class AccountRowView: NSView {
     init(snap: AcctSnap, dotColor: NSColor) {
         self.snap = snap
         self.dotColor = dotColor
-        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 26))
+        super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 26))
         var tip = ""
         if let ep = snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch {
             tip += "重置时间 \(resetAt(ep))"
@@ -397,11 +397,13 @@ final class AccountRowView: NSView {
         let on = snap.active
         (on ? dotColor : dotColor.withAlphaComponent(0.35)).setFill()
         NSBezierPath(ovalIn: NSRect(x: 14, y: 9.5, width: 7, height: 7)).fill()
-        put(seg(snap.cfg.label, on ? .labelColor : .secondaryLabelColor, 13, bold: true), 27, 4.5)
+        let lx = put(seg(snap.cfg.label, on ? .labelColor : .secondaryLabelColor, 13, bold: true), 27, 4.5)
 
         let hasData = snap.weekly != nil || snap.fable != nil
+        // 账户级状态标记跟着账户字母走，不混进数据列
+        if snap.error != nil && hasData { put(seg("⚠", .systemOrange, 9), lx + 3, 7.5) }
         guard hasData else {
-            put(seg(snap.error.map(errText) ?? "暂无数据", .systemRed, 12), 88, 5.5)
+            put(seg(snap.error.map(errText) ?? "暂无数据", .systemRed, 12), 66, 5.5)
             return
         }
 
@@ -412,15 +414,12 @@ final class AccountRowView: NSView {
             let rem = max(0.0, min(100.0, 100.0 - p))
             putRight(seg("剩\(Int(rem))%", remColor(rem), 13, bold: true, mono: true), numRight, 4.5)
         }
-        gauge("Fable", snap.fable, 88, 178)
-        gauge("周", snap.weekly, 196, 252)
+        gauge("Fable", snap.fable, 66, 156)
+        gauge("周", snap.weekly, 176, 248)
 
-        // 右缘：距重置倒计时；降级时前置一个橙色 ⚠（详情在 tooltip）
-        let rt = NSMutableAttributedString()
-        if snap.error != nil { rt.append(seg("⚠ ", .systemOrange, 11)) }
-        rt.append(seg("\(shortLeft(snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch))后重置",
-                      .labelColor, 12, mono: true))
-        putRight(rt, R, 5.5)
+        // 右缘：距重置倒计时（最长 "20时47分后重置" ≈95px，起点 ≥271，与周列保证 ≥20px 间距）
+        putRight(seg("\(shortLeft(snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch))后重置",
+                     .labelColor, 12, mono: true), R, 5.5)
     }
 }
 
@@ -472,13 +471,12 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             att.image = ringImage(frac: (rem ?? 0) / 100.0, color: ringCol)
             att.bounds = CGRect(x: 0, y: -2, width: 13, height: 13)
             title.append(NSAttributedString(attachment: att))
+            // 标题不放警标：闲置账户 token 过期是常态（数据照样够准），错误详情在菜单行/tooltip
             if p != nil {
                 title.append(seg(" \(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
                                  .labelColor, 13, mono: true))
-                if s.error != nil { title.append(seg("⚠", .systemOrange, 9)) }  // 降级小警标
             } else {
-                title.append(seg(s.error != nil ? " !" : " —",
-                                 s.error != nil ? .systemRed : .labelColor, 13))
+                title.append(seg(" —", .labelColor, 13))
             }
         }
         statusItem.button?.attributedTitle = title
