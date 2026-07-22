@@ -22,9 +22,10 @@ let USAGE_URL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let BETA_HEADER = "oauth-2025-04-20"
 let POLL_SEC: TimeInterval = 1800       // 定时节奏：每 tick 只拉一个账户，两账户轮流（单账户 1 小时一次）
                                         // 周额度是慢变量，背景轮询宁懒勿勤；打开菜单时数据过旧会即时补拉
-let MENU_STALE_SEC: TimeInterval = 180  // 打开菜单时最旧账户数据比这旧才顺带触发一次拉取
-let FORCE_MIN_GAP: TimeInterval = 30    // 手动“立即刷新”最小间隔
+let MENU_STALE_SEC: TimeInterval = 180  // 打开菜单时被选账户数据比这旧才顺带触发一次拉取
+let FORCE_MIN_GAP: TimeInterval = 30    // 手动“立即刷新”最小间隔（独立节流，不与自动拉取共享）
 let TICK_MIN_GAP: TimeInterval = 15     // 自动拉取去重间隔（定时器与菜单打开撞车时）
+let ACCT_MIN_GAP: TimeInterval = 300    // 非强刷时单账户最小尝试间隔（防频繁开菜单放大请求）
 let HOME = FileManager.default.homeDirectoryForCurrentUser
 let CURRENT_ACCT_FILE = HOME.appendingPathComponent(".claude-current-acct")
 // 状态文件放二进制同目录（安装后即 Application Support），源码仓库保持干净
@@ -66,11 +67,19 @@ struct AcctSnap {
     var weekly: Block?       // 周限额(全模型)
     var fable: Block?        // Fable 周容量
     var dataAt: Date?        // 数据成功拉到的时间
+    var attemptAt = Date.distantPast   // 上次尝试拉取的时间（不论成败，调度按它轮转）
     var notBefore = Date.distantPast   // 该账户的 429 退避闸门
     var backoff: TimeInterval = 0
 }
 
-final class Ref<T> { var v: T; init(_ v: T) { self.v = v } }
+// 加锁盒子：URLSession 回调线程与等待方之间传结果用（信号量超时后回调可能还活着，裸变量会撕裂读写）
+final class Locked<T> {
+    private let lock = NSLock()
+    private var value: T
+    init(_ v: T) { value = v }
+    func get() -> T { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ v: T) { lock.lock(); defer { lock.unlock() }; value = v }
+}
 
 // ---- 取数与缓存 ----
 final class UsageStore {
@@ -80,6 +89,7 @@ final class UsageStore {
     private var snaps: [AcctSnap]
     private var refreshing = false
     private var lastAttempt = Date.distantPast
+    private var lastForce = Date.distantPast             // 手动刷新独立节流
     private var globalCooldown = Date.distantPast        // 任一账户 429 后的短全局冷却
     var onUpdate: (() -> Void)?                          // 主线程回调
 
@@ -92,6 +102,9 @@ final class UsageStore {
                 snaps[i].weekly = Block.from(e["weekly"])
                 snaps[i].fable = Block.from(e["fable"])
                 snaps[i].dataAt = (e["at"] as? Double).map { Date(timeIntervalSince1970: $0) }
+                // 退避窗口跨重启保留：重启不等于可以无视服务器的 Retry-After
+                if let nb = e["not_before"] as? Double { snaps[i].notBefore = Date(timeIntervalSince1970: nb) }
+                if let bo = e["backoff"] as? Double { snaps[i].backoff = bo }
             }
         }
     }
@@ -112,40 +125,41 @@ final class UsageStore {
         return newest.map { -$0.timeIntervalSinceNow }
     }
 
-    // 数据最旧的账户的年龄（给菜单打开时判断要不要顺带拉一次）
-    func stalestAge() -> TimeInterval {
-        var oldest: Date?
-        stateQ.sync {
-            if snaps.contains(where: { $0.dataAt == nil }) { oldest = nil }
-            else { oldest = snaps.compactMap { $0.dataAt }.min() }
-        }
-        return oldest.map { -$0.timeIntervalSinceNow } ?? .infinity
-    }
-
-    // 一个 tick 只拉一个账户（数据最旧且已过退避期的那个）；force=手动刷新，全拉且无视退避
-    func tick(force: Bool = false) {
+    // 一个 tick 只拉一个账户：按“上次尝试时间”轮转（不论成败都推进，失败账户不会
+    // 独占调度饿死健康账户）。staleGate 给菜单打开用：被选账户数据够新就不拉。
+    // force=手动刷新：全拉、无视退避，但有自己的独立节流。
+    func tick(force: Bool = false, staleGate: TimeInterval? = nil) {
         let now = Date()
         var targets: [Int] = []
         stateQ.sync {
             if refreshing { return }
-            if now.timeIntervalSince(lastAttempt) < (force ? FORCE_MIN_GAP : TICK_MIN_GAP) { return }
             if force {
+                if now.timeIntervalSince(lastForce) < FORCE_MIN_GAP { return }
+                lastForce = now
                 targets = Array(snaps.indices)
             } else {
+                if now.timeIntervalSince(lastAttempt) < TICK_MIN_GAP { return }
                 if now < globalCooldown { return }
-                let eligible = snaps.indices.filter { now >= snaps[$0].notBefore }
-                guard let pick = eligible.min(by: {
-                    (snaps[$0].dataAt ?? .distantPast) < (snaps[$1].dataAt ?? .distantPast)
-                }) else { return }
+                let eligible = snaps.indices.filter {
+                    now >= snaps[$0].notBefore &&
+                    now.timeIntervalSince(snaps[$0].attemptAt) >= ACCT_MIN_GAP
+                }
+                guard let pick = eligible.min(by: { snaps[$0].attemptAt < snaps[$1].attemptAt })
+                else { return }
+                // 闸门作用在真正要拉的账户上（而不是别的账户的新旧）
+                if let gate = staleGate, let at = snaps[pick].dataAt,
+                   now.timeIntervalSince(at) <= gate { return }
                 targets = [pick]
             }
-            refreshing = true; lastAttempt = now
+            refreshing = true
+            lastAttempt = now
+            for i in targets { snaps[i].attemptAt = now }
         }
         guard !targets.isEmpty else { return }
-        workQ.async { self.doRefresh(targets) }
+        workQ.async { self.doRefresh(targets, force: force) }
     }
 
-    private func doRefresh(_ idxs: [Int]) {
+    private func doRefresh(_ idxs: [Int], force: Bool) {
         var results = [Int: (Block?, Block?, String?, Double?)]()  // idx -> (weekly, fable, err, retryAfter)
         for i in idxs { results[i] = Self.fetchAccount(ACCOUNTS[i]) }  // 串行，避免同瞬间双请求
         let now = Date()
@@ -154,8 +168,13 @@ final class UsageStore {
                 if let err = r.2 {
                     snaps[i].error = err
                     if err == "http_429" {
-                        snaps[i].backoff = snaps[i].backoff == 0 ? 300 : min(snaps[i].backoff * 2, 3600)
-                        if let ra = r.3 { snaps[i].backoff = min(max(snaps[i].backoff, ra), 3600) }
+                        if force {
+                            // 手动重试失败不加倍退避——用户连点不应把退避推到一小时
+                            snaps[i].backoff = min(max(snaps[i].backoff, r.3 ?? 300), 3600)
+                        } else {
+                            snaps[i].backoff = snaps[i].backoff == 0 ? 300 : min(snaps[i].backoff * 2, 3600)
+                            if let ra = r.3 { snaps[i].backoff = min(max(snaps[i].backoff, ra), 3600) }
+                        }
                         snaps[i].notBefore = now.addingTimeInterval(snaps[i].backoff)
                         globalCooldown = max(globalCooldown, now.addingTimeInterval(60))
                     }
@@ -179,7 +198,9 @@ final class UsageStore {
         stateQ.sync {
             for s in snaps where s.dataAt != nil {
                 obj[s.cfg.id] = ["at": s.dataAt!.timeIntervalSince1970,
-                                 "weekly": j(s.weekly?.dict), "fable": j(s.fable?.dict)]
+                                 "weekly": j(s.weekly?.dict), "fable": j(s.fable?.dict),
+                                 "not_before": s.notBefore.timeIntervalSince1970,
+                                 "backoff": s.backoff]
             }
         }
         if let d = try? JSONSerialization.data(withJSONObject: obj) {
@@ -207,7 +228,8 @@ final class UsageStore {
             func modelName(_ l: [String: Any]) -> String {
                 (((l["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String) ?? ""
             }
-            let pick = scoped.first { modelName($0).localizedCaseInsensitiveContains("fable") } ?? scoped.first
+            // 只认名字匹配 Fable 的桶；匹配不上就留空（UI 标签写死是 Fable，不能拿别的模型的桶冒充）
+            let pick = scoped.first { modelName($0).localizedCaseInsensitiveContains("fable") }
             fable = pick.map(blk)
         }
         return (weekly, fable)
@@ -222,25 +244,29 @@ final class UsageStore {
         req.setValue(BETA_HEADER, forHTTPHeaderField: "anthropic-beta")
         req.setValue("claude-reset-widget/2.0", forHTTPHeaderField: "User-Agent")
         let sem = DispatchSemaphore(value: 0)
-        let out = Ref<(Block?, Block?, String?, Double?)>((nil, nil, "err_timeout", nil))
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        let out = Locked<(Block?, Block?, String?, Double?)>((nil, nil, "err_timeout", nil))
+        let task = URLSession.shared.dataTask(with: req) { data, resp, err in
             defer { sem.signal() }
-            if err != nil { out.v = (nil, nil, "err_network", nil); return }
-            guard let http = resp as? HTTPURLResponse else { out.v = (nil, nil, "err_network", nil); return }
-            if http.statusCode == 401 { out.v = (nil, nil, "token_expired", nil); return }
+            if err != nil { out.set((nil, nil, "err_network", nil)); return }
+            guard let http = resp as? HTTPURLResponse else { out.set((nil, nil, "err_network", nil)); return }
+            if http.statusCode == 401 { out.set((nil, nil, "token_expired", nil)); return }
             if http.statusCode == 429 {
                 let ra = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-                out.v = (nil, nil, "http_429", ra); return
+                out.set((nil, nil, "http_429", ra)); return
             }
             guard http.statusCode == 200, let d = data,
                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
-                out.v = (nil, nil, "http_\(http.statusCode)", nil); return
+                out.set((nil, nil, "http_\(http.statusCode)", nil)); return
             }
             let (w, f) = parseUsage(obj)
-            out.v = (w, f, nil, nil)
-        }.resume()
-        _ = sem.wait(timeout: .now() + 15)
-        return out.v
+            // 200 但解析不出任何额度桶：按错误处理，绝不能拿 nil 覆盖缓存里的好数据
+            if w == nil && f == nil { out.set((nil, nil, "err_parse", nil)); return }
+            out.set((w, f, nil, nil))
+        }
+        task.resume()
+        // timeoutInterval 是空闲超时；这里兜一个总时长上限，超了就取消任务（不留孤儿请求）
+        if sem.wait(timeout: .now() + 15) == .timedOut { task.cancel() }
+        return out.get()
     }
 
     static func readToken(_ service: String) -> String? {
@@ -253,7 +279,8 @@ final class UsageStore {
         let sem = DispatchSemaphore(value: 0)
         p.terminationHandler = { _ in sem.signal() }
         do { try p.run() } catch { return nil }
-        if sem.wait(timeout: .now() + 5) == .timedOut { p.terminate(); return nil }
+        // 45s：给钥匙串授权弹窗留出人手点击的时间（5s 会把弹窗杀掉，用户永远来不及授权）
+        if sem.wait(timeout: .now() + 45) == .timedOut { p.terminate(); return nil }
         guard p.terminationStatus == 0 else { return nil }
         let d = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return nil }
@@ -283,14 +310,28 @@ func shortLeft(_ epoch: Double?) -> String {
     return "\(m)分"
 }
 
-// 菜单栏标题里的极简倒计时："6d" / "8h" / "<1h"
+// 菜单栏标题里的极简倒计时："6d" / "8h" / "45m"；已过重置点显示 ✓（额度已恢复）
 func tinyLeft(_ epoch: Double?) -> String {
     guard let e = epoch else { return "?" }
     let s = Int(e - Date().timeIntervalSince1970)
-    if s <= 0 { return "0" }
+    if s <= 0 { return "✓" }
     if s >= 86400 { return "\(s / 86400)d" }
     if s >= 3600 { return "\(s / 3600)h" }
     return "\(max(1, s / 60))m"
+}
+
+// 有效剩余量：重置时刻一过，额度实际已恢复 100%——不能拿旧数据的红环吓人
+func effectiveRem(_ b: Block?) -> Double? {
+    guard let b = b, let p = b.pct else { return nil }
+    if let e = b.resetsEpoch, e <= Date().timeIntervalSince1970 { return 100 }
+    return max(0.0, min(100.0, 100.0 - p))
+}
+
+// 菜单行的重置说明；哨兵情况（已过/未知）单独成句，不与"后重置"拼接出乱语
+func resetPhrase(_ epoch: Double?) -> String {
+    guard let e = epoch else { return "—" }
+    if e <= Date().timeIntervalSince1970 { return "已重置" }
+    return shortLeft(epoch) + "后重置"
 }
 
 // 富文本小段
@@ -336,6 +377,7 @@ func shortErr(_ code: String) -> String {
 func resetAt(_ epoch: Double?) -> String {
     guard let e = epoch else { return "" }
     let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")  // 固定 24 小时制，不被系统 12 小时偏好改写
     f.dateFormat = "MM-dd HH:mm"
     return f.string(from: Date(timeIntervalSince1970: e))
 }
@@ -351,6 +393,7 @@ func errText(_ code: String) -> String {
     case "token_expired": return "Token 过期 · 跑一次 claude 刷新"
     case "no_token":      return "钥匙串无凭据"
     case "http_429":      return "上游限流(429)"
+    case "err_parse":     return "响应结构异常(已保留旧数据)"
     default:              return "拉取失败: \(code)"
     }
 }
@@ -367,7 +410,7 @@ final class AccountRowView: NSView {
         self.dotColor = dotColor
         super.init(frame: NSRect(x: 0, y: 0, width: 380, height: 26))
         var tip = ""
-        if let ep = snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch {
+        if let ep = (snap.fable ?? snap.weekly)?.resetsEpoch {
             tip += "重置时间 \(resetAt(ep))"
         }
         if let at = snap.dataAt {
@@ -410,15 +453,14 @@ final class AccountRowView: NSView {
         // 两列数字：标签固定 x，数字右对齐固定右缘（跨行对齐）；颜色即严重度
         func gauge(_ name: String, _ b: Block?, _ labelX: CGFloat, _ numRight: CGFloat) {
             put(seg(name, .secondaryLabelColor, 11), labelX, 7)
-            guard let p = b?.pct else { putRight(seg("—", .secondaryLabelColor, 12), numRight, 6); return }
-            let rem = max(0.0, min(100.0, 100.0 - p))
+            guard let rem = effectiveRem(b) else { putRight(seg("—", .secondaryLabelColor, 12), numRight, 6); return }
             putRight(seg("剩\(Int(rem))%", remColor(rem), 13, bold: true, mono: true), numRight, 4.5)
         }
         gauge("Fable", snap.fable, 66, 156)
         gauge("周", snap.weekly, 176, 248)
 
         // 右缘：距重置倒计时（最长 "20时47分后重置" ≈95px，起点 ≥271，与周列保证 ≥20px 间距）
-        putRight(seg("\(shortLeft(snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch))后重置",
+        putRight(seg(resetPhrase((snap.fable ?? snap.weekly)?.resetsEpoch),
                      .labelColor, 12, mono: true), R, 5.5)
     }
 }
@@ -451,7 +493,7 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        if store.stalestAge() > MENU_STALE_SEC { store.tick() }
+        store.tick(staleGate: MENU_STALE_SEC)
         render()
     }
 
@@ -463,8 +505,8 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let title = NSMutableAttributedString()
         for (i, s) in snaps.enumerated() {
             if i > 0 { title.append(NSAttributedString(string: "  ")) }
-            let p = s.fable?.pct ?? s.weekly?.pct   // 没有 Fable 桶时退回周限额
-            let rem = p.map { max(0.0, min(100.0, 100.0 - $0)) }
+            let blk = s.fable ?? s.weekly   // 整块选桶：pct 和重置时间必须来自同一个桶，不按字段各取各的
+            let rem = effectiveRem(blk)
             var ringCol = NSColor.labelColor
             if let r = rem, r <= 30 { ringCol = r <= 10 ? .systemRed : .systemOrange }
             let att = NSTextAttachment()
@@ -472,9 +514,8 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             att.bounds = CGRect(x: 0, y: -2, width: 13, height: 13)
             title.append(NSAttributedString(attachment: att))
             // 标题不放警标：闲置账户 token 过期是常态（数据照样够准），错误详情在菜单行/tooltip
-            if p != nil {
-                title.append(seg(" \(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
-                                 .labelColor, 13, mono: true))
+            if rem != nil {
+                title.append(seg(" \(tinyLeft(blk?.resetsEpoch))", .labelColor, 13, mono: true))
             } else {
                 title.append(seg(" —", .labelColor, 13))
             }
