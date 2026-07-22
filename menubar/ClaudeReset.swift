@@ -339,7 +339,7 @@ final class AccountRowView: NSView {
     init(snap: AcctSnap, dotColor: NSColor) {
         self.snap = snap
         self.dotColor = dotColor
-        super.init(frame: NSRect(x: 0, y: 0, width: 336, height: 48))
+        super.init(frame: NSRect(x: 0, y: 0, width: 352, height: 48))
     }
     required init?(coder: NSCoder) { fatalError("unused") }
     override var isFlipped: Bool { true }
@@ -357,22 +357,24 @@ final class AccountRowView: NSView {
         return x + a.size().width
     }
 
-    // "Fable ▬▬▬▬▬░░ 52%"，返回结束 x
-    private func drawGauge(_ name: String, _ b: Block?, _ x0: CGFloat) -> CGFloat {
-        var x = put(seg(name, .secondaryLabelColor, 11), x0, 27)
-        x += 7
-        guard let p = b?.pct else { return put(seg("—", .tertiaryLabelColor, 11), x, 27) }
+    // 一格仪表，固定列布局：label 槽 | 70px 条 | 右对齐百分比槽（跨行列对齐、基线统一）
+    private func drawGauge(_ name: String, _ b: Block?, labelX: CGFloat, barX: CGFloat, pctRight: CGFloat) {
+        put(seg(name, .secondaryLabelColor, 11), labelX, 26)
+        guard let p = b?.pct else {
+            put(seg("—", .tertiaryLabelColor, 11), barX, 26)
+            return
+        }
         let rem = max(0.0, min(100.0, 100.0 - p))
-        let barW: CGFloat = 74
+        let barW: CGFloat = 70
         NSColor.quaternaryLabelColor.setFill()
-        NSBezierPath(roundedRect: NSRect(x: x, y: 32, width: barW, height: 4), xRadius: 2, yRadius: 2).fill()
+        NSBezierPath(roundedRect: NSRect(x: barX, y: 30, width: barW, height: 4), xRadius: 2, yRadius: 2).fill()
         let fw = barW * CGFloat(rem) / 100
         if fw >= 1 {
             barColor(rem).setFill()
-            NSBezierPath(roundedRect: NSRect(x: x, y: 32, width: fw, height: 4), xRadius: 2, yRadius: 2).fill()
+            NSBezierPath(roundedRect: NSRect(x: barX, y: 30, width: fw, height: 4), xRadius: 2, yRadius: 2).fill()
         }
-        x += barW + 7
-        return put(seg("剩\(Int(rem))%", .labelColor, 12, bold: true, mono: true), x, 25)
+        let pct = seg("剩\(Int(rem))%", .labelColor, 12, bold: true, mono: true)
+        put(pct, pctRight - pct.size().width, 25)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -384,10 +386,10 @@ final class AccountRowView: NSView {
         var x = put(seg(snap.cfg.label, .labelColor, 13, bold: true), L + 13, 5)
         if snap.active {
             let t = seg("在用", .systemGreen, 9, bold: true)
-            let badge = NSRect(x: x + 6, y: 6, width: t.size().width + 10, height: 14)
+            let badge = NSRect(x: x + 6, y: 6.5, width: t.size().width + 10, height: 14)
             NSColor.systemGreen.withAlphaComponent(0.16).setFill()
             NSBezierPath(roundedRect: badge, xRadius: 7, yRadius: 7).fill()
-            put(t, badge.minX + 5, 8)
+            put(t, badge.minX + 5, 8.5)
             x = badge.maxX
         }
         let hasData = snap.weekly != nil || snap.fable != nil
@@ -404,10 +406,10 @@ final class AccountRowView: NSView {
         }
         put(right, R - right.size().width, 6)
 
-        // 第二行：两个容量条
+        // 第二行：两个容量条，固定列（Fable: 14/52/172，周: 194/214/右缘）
         if hasData {
-            let end = drawGauge("Fable", snap.fable, L)
-            _ = drawGauge("周", snap.weekly, end + 20)
+            drawGauge("Fable", snap.fable, labelX: L, barX: 52, pctRight: 172)
+            drawGauge("周", snap.weekly, labelX: 194, barX: 214, pctRight: R)
         } else {
             put(seg(snap.error.map(errText) ?? "暂无数据", .systemRed, 12), L, 26)
         }
