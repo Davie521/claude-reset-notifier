@@ -440,16 +440,17 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for (i, s) in snaps.enumerated() {
             if i > 0 { title.append(NSAttributedString(string: " ")) }
             title.append(seg("●", dot[i % dot.count], 8))
+            // 菜单栏背景被壁纸染色、不可控：禁用半透明灰，全部实色，层级只靠字号
             let p = s.fable?.pct ?? s.weekly?.pct   // 没有 Fable 桶时退回周限额
             if let p = p {
                 let rem = max(0, 100 - Int(p))
-                let col: NSColor = s.error != nil ? .systemOrange : remColor(Double(rem))  // 橙=降级旧数据
-                title.append(seg("剩\(rem)", col, 12, mono: true))
-                title.append(seg("·\(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
-                                 .secondaryLabelColor, 10, mono: true))
+                title.append(seg("剩\(rem)", remColor(Double(rem)), 12, mono: true))  // 橙/红只表示余量警戒
+                title.append(seg(" \(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
+                                 .labelColor, 10, mono: true))
+                if s.error != nil { title.append(seg("⚠", .systemOrange, 9)) }  // 降级=小警标，不再整体变橙
             } else {
                 title.append(seg(s.error != nil ? "!" : "—",
-                                 s.error != nil ? .systemRed : .secondaryLabelColor, 12))
+                                 s.error != nil ? .systemRed : .labelColor, 12))
             }
         }
         statusItem.button?.attributedTitle = title
