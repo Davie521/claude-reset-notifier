@@ -291,11 +291,14 @@ final class UsageStore {
 }
 
 // ---- 展示工具 ----
-// 颜色按“剩余”算：越少越红
+// 颜色按“剩余”算：越少越警示。向文字色混 35% 压饱和度——
+// 大号粗体数字用纯 systemOrange/Red 在浅色菜单里太刺眼
 func remColor(_ rem: Double) -> NSColor {
-    if rem <= 10 { return .systemRed }
-    if rem <= 30 { return .systemOrange }
-    return .labelColor
+    let base: NSColor
+    if rem <= 10 { base = .systemRed }
+    else if rem <= 30 { base = .systemOrange }
+    else { return .labelColor }
+    return base.blended(withFraction: 0.35, of: .labelColor) ?? base
 }
 
 // 菜单里的倒计时："1天8时" / "8时20分" / "45分"
