@@ -30,11 +30,27 @@ macOS 菜单栏小组件：监控两个 Claude 账户的 **Fable 周容量**和*
 
 ## 安装
 
+两种方式**二选一**（同时跑会出现两个图标并把 usage 接口打限流）。
+
+**方式一：Homebrew（私有 tap，适合装到其他机器）**
+
+```bash
+brew tap davie521/tap git@github.com:Davie521/homebrew-tap.git
+brew install davie521/tap/claude-reset-notifier
+brew services start davie521/tap/claude-reset-notifier   # 菜单栏常驻 + 登录自启
+```
+
+要求：机器有该 GitHub 账号的 SSH 权限（源码和 tap 都是私有仓库）、装了 Xcode Command Line Tools（用 swiftc 从源码编译）。
+
+**方式二：install.sh（本机开发用）**
+
 ```bash
 ./install.sh
 ```
 
 编译后装到 `~/Library/Application Support/claude-reset/` 并注册 LaunchAgent `com.yifan.claude-reset-menubar`（登录自启；内部标识沿用 claude-reset，改名不迁移运行时）。运行时文件不放仓库目录（Desktop 是 TCC 保护路径，launchd 后台进程在里面读写不稳）。
+
+两种方式的状态文件都在 `~/Library/Application Support/claude-reset/state.json`。发新版：源码仓库打 tag 后，更新 [homebrew-tap](https://github.com/Davie521/homebrew-tap) 配方里的 `tag`/`revision`。
 
 账户配置在 `menubar/ClaudeReset.swift` 顶部 `ACCOUNTS`；keychain service 名用 `security dump-keychain | grep 'Claude Code-credentials'` 查。当前在用账户的标记读 `~/.claude-current-acct`（内容 `a` 或 `b`）。
 
