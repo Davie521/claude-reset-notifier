@@ -290,7 +290,7 @@ func tinyLeft(_ epoch: Double?) -> String {
     if s <= 0 { return "0" }
     if s >= 86400 { return "\(s / 86400)d" }
     if s >= 3600 { return "\(s / 3600)h" }
-    return "<1h"
+    return "\(max(1, s / 60))m"
 }
 
 // 富文本小段
@@ -298,6 +298,30 @@ func seg(_ s: String, _ color: NSColor, _ size: CGFloat, bold: Bool = false, mon
     let font = mono ? NSFont.monospacedDigitSystemFont(ofSize: size, weight: bold ? .semibold : .regular)
                     : (bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size))
     return NSAttributedString(string: s, attributes: [.foregroundColor: color, .font: font])
+}
+
+// 菜单栏用的迷你余量圆环：frac=剩余比例，从 12 点顺时针消耗
+func ringImage(frac: Double, color: NSColor, size: CGFloat = 13) -> NSImage {
+    NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
+        let lw: CGFloat = 2.5
+        let r = (size - lw) / 2
+        let c = NSPoint(x: size / 2, y: size / 2)
+        let track = NSBezierPath()
+        track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
+        track.lineWidth = lw
+        color.withAlphaComponent(0.25).setStroke()
+        track.stroke()
+        if frac > 0.02 {
+            let arc = NSBezierPath()
+            arc.appendArc(withCenter: c, radius: r, startAngle: 90,
+                          endAngle: 90 - 360 * CGFloat(min(1, frac)), clockwise: true)
+            arc.lineWidth = lw
+            arc.lineCapStyle = .round
+            color.setStroke()
+            arc.stroke()
+        }
+        return true
+    }
 }
 
 func shortErr(_ code: String) -> String {
@@ -432,25 +456,29 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
-    // 菜单栏标题: 每账户 "●52·1d" —— Fable 剩余% + 距重置时间（周额度和 Fable 同时重置）
+    // 菜单栏标题: 每账户 = 余量圆环(图形) + 距重置时间(文字主角)，如 "◔ 5d  ◑ 21h"
+    // 环填充比例 = Fable 剩余；环色 = 账户识别色(A绿/B蓝)，剩≤30% 橙、≤10% 红
     func render() {
         let snaps = store.snapshot()
         let dot: [NSColor] = [.systemGreen, .systemBlue]
         let title = NSMutableAttributedString()
         for (i, s) in snaps.enumerated() {
-            if i > 0 { title.append(NSAttributedString(string: " ")) }
-            title.append(seg("●", dot[i % dot.count], 8))
-            // 菜单栏背景被壁纸染色、不可控：禁用半透明灰，全部实色，层级只靠字号
+            if i > 0 { title.append(NSAttributedString(string: "  ")) }
             let p = s.fable?.pct ?? s.weekly?.pct   // 没有 Fable 桶时退回周限额
-            if let p = p {
-                let rem = max(0, 100 - Int(p))
-                title.append(seg("剩\(rem)", remColor(Double(rem)), 12, mono: true))  // 橙/红只表示余量警戒
+            let rem = p.map { max(0.0, min(100.0, 100.0 - $0)) }
+            var ringCol = dot[i % dot.count]
+            if let r = rem, r <= 30 { ringCol = r <= 10 ? .systemRed : .systemOrange }
+            let att = NSTextAttachment()
+            att.image = ringImage(frac: (rem ?? 0) / 100.0, color: ringCol)
+            att.bounds = CGRect(x: 0, y: -2, width: 13, height: 13)
+            title.append(NSAttributedString(attachment: att))
+            if p != nil {
                 title.append(seg(" \(tinyLeft(s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch))",
-                                 .labelColor, 10, mono: true))
-                if s.error != nil { title.append(seg("⚠", .systemOrange, 9)) }  // 降级=小警标，不再整体变橙
+                                 .labelColor, 13, mono: true))
+                if s.error != nil { title.append(seg("⚠", .systemOrange, 9)) }  // 降级小警标
             } else {
-                title.append(seg(s.error != nil ? "!" : "—",
-                                 s.error != nil ? .systemRed : .labelColor, 12))
+                title.append(seg(s.error != nil ? " !" : " —",
+                                 s.error != nil ? .systemRed : .labelColor, 13))
             }
         }
         statusItem.button?.attributedTitle = title
