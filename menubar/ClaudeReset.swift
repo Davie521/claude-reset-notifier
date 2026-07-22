@@ -28,9 +28,9 @@ let TICK_MIN_GAP: TimeInterval = 15     // 自动拉取去重间隔（定时器�
 let ACCT_MIN_GAP: TimeInterval = 300    // 非强刷时单账户最小尝试间隔（防频繁开菜单放大请求）
 let HOME = FileManager.default.homeDirectoryForCurrentUser
 let CURRENT_ACCT_FILE = HOME.appendingPathComponent(".claude-current-acct")
-// 状态文件放二进制同目录（安装后即 Application Support），源码仓库保持干净
-let EXE_DIR = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent()
-let STATE_FILE = EXE_DIR.appendingPathComponent("state.json")
+// 状态文件固定在 Application Support（不跟二进制走：brew 装的二进制在 Cellar，升级会清空）
+let STATE_DIR = HOME.appendingPathComponent("Library/Application Support/claude-reset")
+let STATE_FILE = STATE_DIR.appendingPathComponent("state.json")
 
 func j(_ v: Any?) -> Any { v ?? NSNull() }
 
@@ -95,6 +95,7 @@ final class UsageStore {
 
     private init() {
         snaps = ACCOUNTS.map { AcctSnap(cfg: $0) }
+        try? FileManager.default.createDirectory(at: STATE_DIR, withIntermediateDirectories: true)
         if let d = try? Data(contentsOf: STATE_FILE),
            let obj = try? JSONSerialization.jsonObject(with: d) as? [String: [String: Any]] {
             for i in snaps.indices {
