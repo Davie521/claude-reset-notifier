@@ -331,7 +331,9 @@ func errText(_ code: String) -> String {
     }
 }
 
-// ---- 菜单账户行（自绘视图：容量条 + 倒计时，系统语义色自动适配深浅色） ----
+// ---- 菜单账户行（单行自绘视图，信息最小编码） ----
+// 冗余全部砍掉：数字颜色即严重度（不再画条）；在用状态编码进身份点（实色 vs 半透明）；
+// 绝对日期/数据年龄/错误详情放 tooltip，悬停即见，平时零占用。
 final class AccountRowView: NSView {
     private let snap: AcctSnap
     private let dotColor: NSColor
@@ -339,80 +341,62 @@ final class AccountRowView: NSView {
     init(snap: AcctSnap, dotColor: NSColor) {
         self.snap = snap
         self.dotColor = dotColor
-        super.init(frame: NSRect(x: 0, y: 0, width: 352, height: 48))
+        super.init(frame: NSRect(x: 0, y: 0, width: 360, height: 26))
+        var tip = ""
+        if let ep = snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch {
+            tip += "重置时间 \(resetAt(ep))"
+        }
+        if let at = snap.dataAt {
+            tip += (tip.isEmpty ? "" : "\n") + "数据更新于 \(ageText(-at.timeIntervalSinceNow))"
+        }
+        if let e = snap.error {
+            tip += (tip.isEmpty ? "" : "\n") + "上次拉取失败：\(errText(e))"
+        }
+        toolTip = tip.isEmpty ? nil : tip
     }
     required init?(coder: NSCoder) { fatalError("unused") }
     override var isFlipped: Bool { true }
-
-    // 容量条填充色：剩得越少越警示
-    private func barColor(_ rem: Double) -> NSColor {
-        if rem <= 10 { return .systemRed }
-        if rem <= 30 { return .systemOrange }
-        return .systemGreen
-    }
 
     @discardableResult
     private func put(_ a: NSAttributedString, _ x: CGFloat, _ y: CGFloat) -> CGFloat {
         a.draw(at: NSPoint(x: x, y: y))
         return x + a.size().width
     }
-
-    // 一格仪表，固定列布局：label 槽 | 70px 条 | 右对齐百分比槽（跨行列对齐、基线统一）
-    private func drawGauge(_ name: String, _ b: Block?, labelX: CGFloat, barX: CGFloat, pctRight: CGFloat) {
-        put(seg(name, .secondaryLabelColor, 11), labelX, 26)
-        guard let p = b?.pct else {
-            put(seg("—", .tertiaryLabelColor, 11), barX, 26)
-            return
-        }
-        let rem = max(0.0, min(100.0, 100.0 - p))
-        let barW: CGFloat = 70
-        NSColor.quaternaryLabelColor.setFill()
-        NSBezierPath(roundedRect: NSRect(x: barX, y: 30, width: barW, height: 4), xRadius: 2, yRadius: 2).fill()
-        let fw = barW * CGFloat(rem) / 100
-        if fw >= 1 {
-            barColor(rem).setFill()
-            NSBezierPath(roundedRect: NSRect(x: barX, y: 30, width: fw, height: 4), xRadius: 2, yRadius: 2).fill()
-        }
-        let pct = seg("剩\(Int(rem))%", .labelColor, 12, bold: true, mono: true)
-        put(pct, pctRight - pct.size().width, 25)
+    private func putRight(_ a: NSAttributedString, _ right: CGFloat, _ y: CGFloat) {
+        a.draw(at: NSPoint(x: right - a.size().width, y: y))
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let L: CGFloat = 14, R = bounds.width - 14
+        let R = bounds.width - 14
 
-        // 第一行：身份点 + 账户名 + 在用徽章 | 右对齐：距重置 + 日期 (+降级标记)
-        dotColor.setFill()
-        NSBezierPath(ovalIn: NSRect(x: L, y: 10, width: 7, height: 7)).fill()
-        var x = put(seg(snap.cfg.label, .labelColor, 13, bold: true), L + 13, 5)
-        if snap.active {
-            let t = seg("在用", .systemGreen, 9, bold: true)
-            let badge = NSRect(x: x + 6, y: 6.5, width: t.size().width + 10, height: 14)
-            NSColor.systemGreen.withAlphaComponent(0.16).setFill()
-            NSBezierPath(roundedRect: badge, xRadius: 7, yRadius: 7).fill()
-            put(t, badge.minX + 5, 8.5)
-            x = badge.maxX
-        }
+        // 身份点 + 账户名：在用=实色点+全亮字，闲置=半透明点+次级灰字
+        let on = snap.active
+        (on ? dotColor : dotColor.withAlphaComponent(0.35)).setFill()
+        NSBezierPath(ovalIn: NSRect(x: 14, y: 9.5, width: 7, height: 7)).fill()
+        put(seg(snap.cfg.label, on ? .labelColor : .secondaryLabelColor, 13, bold: true), 27, 4.5)
+
         let hasData = snap.weekly != nil || snap.fable != nil
-        let right = NSMutableAttributedString()
-        if hasData {
-            let ep = snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch
-            right.append(seg("\(shortLeft(ep))后重置", .labelColor, 12, mono: true))
-            right.append(seg("  \(resetAt(ep))", .tertiaryLabelColor, 10, mono: true))
+        guard hasData else {
+            put(seg(snap.error.map(errText) ?? "暂无数据", .systemRed, 12), 88, 5.5)
+            return
         }
-        if let e = snap.error {
-            var w = "  ⚠\(shortErr(e))"
-            if hasData, let at = snap.dataAt { w += "·\(ageText(-at.timeIntervalSinceNow))" }
-            right.append(seg(w, .systemOrange, 10))
-        }
-        put(right, R - right.size().width, 6)
 
-        // 第二行：两个容量条，固定列（Fable: 14/52/172，周: 194/214/右缘）
-        if hasData {
-            drawGauge("Fable", snap.fable, labelX: L, barX: 52, pctRight: 172)
-            drawGauge("周", snap.weekly, labelX: 194, barX: 214, pctRight: R)
-        } else {
-            put(seg(snap.error.map(errText) ?? "暂无数据", .systemRed, 12), L, 26)
+        // 两列数字：标签固定 x，数字右对齐固定右缘（跨行对齐）；颜色即严重度
+        func gauge(_ name: String, _ b: Block?, _ labelX: CGFloat, _ numRight: CGFloat) {
+            put(seg(name, .secondaryLabelColor, 11), labelX, 7)
+            guard let p = b?.pct else { putRight(seg("—", .secondaryLabelColor, 12), numRight, 6); return }
+            let rem = max(0.0, min(100.0, 100.0 - p))
+            putRight(seg("剩\(Int(rem))%", remColor(rem), 13, bold: true, mono: true), numRight, 4.5)
         }
+        gauge("Fable", snap.fable, 88, 178)
+        gauge("周", snap.weekly, 196, 252)
+
+        // 右缘：距重置倒计时；降级时前置一个橙色 ⚠（详情在 tooltip）
+        let rt = NSMutableAttributedString()
+        if snap.error != nil { rt.append(seg("⚠ ", .systemOrange, 11)) }
+        rt.append(seg("\(shortLeft(snap.fable?.resetsEpoch ?? snap.weekly?.resetsEpoch))后重置",
+                      .labelColor, 12, mono: true))
+        putRight(rt, R, 5.5)
     }
 }
 
@@ -491,7 +475,7 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         if let age = store.dataAge() {
             menu.addItem(infoItem(seg("更新于 \(ageText(age)) · 后台每小时轮询一次/账户",
-                                      .tertiaryLabelColor, 11)))
+                                      .secondaryLabelColor, 11)))
         }
         add(menu, "立即刷新", #selector(doRefresh), "r")
         add(menu, "退出", #selector(quit), "q")
