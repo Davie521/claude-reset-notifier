@@ -1,4 +1,4 @@
-// Claude 双账户重置 —— 无后端单体版 v2
+// Claude Reset Notifier —— Claude 双账户重置监控，无后端单体版
 // 一个菜单栏 App 干完所有事：读钥匙串 → 拉 Anthropic 用量 → 菜单栏展示。
 // 只关注两件事：周限额(用量+重置时间) 和 Fable 周容量(用量+重置时间)。
 // robust 设计：
