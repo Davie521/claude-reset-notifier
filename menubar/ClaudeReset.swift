@@ -345,26 +345,33 @@ func seg(_ s: String, _ color: NSColor, _ size: CGFloat, bold: Bool = false, mon
     return NSAttributedString(string: s, attributes: [.foregroundColor: color, .font: font])
 }
 
-// 菜单栏用的迷你余量圆环：frac=剩余比例，从 12 点顺时针消耗
-func ringImage(frac: Double, color: NSColor, size: CGFloat = 13) -> NSImage {
+// 菜单栏用的迷你余量同心双环：外环=周限额，内环=Fable。
+// 全程单色 labelColor（菜单栏惯例，壁纸染色/深浅切换下都清晰），不做橙/红警示：
+// 额度本来就是拿来花完的，剩得少是常态不是事故，环只当油量表不当告警器；
+// 身份由内外位置编码，也不配身份色。菜单里的数字警色(remColor)另说——那里看的是细节。
+// rem=剩余%(0-100)，从 12 点顺时针消耗，nil(无数据)只画淡轨道
+func ringImage(outerRem: Double?, innerRem: Double?, size: CGFloat = 15) -> NSImage {
     NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
-        let lw: CGFloat = 2.5
-        let r = (size - lw) / 2
         let c = NSPoint(x: size / 2, y: size / 2)
-        let track = NSBezierPath()
-        track.appendArc(withCenter: c, radius: r, startAngle: 0, endAngle: 360)
-        track.lineWidth = lw
-        color.withAlphaComponent(0.25).setStroke()
-        track.stroke()
-        if frac > 0.02 {
+        let lw: CGFloat = 2
+        func ring(_ radius: CGFloat, _ rem: Double?) {
+            let track = NSBezierPath()
+            track.appendArc(withCenter: c, radius: radius, startAngle: 0, endAngle: 360)
+            track.lineWidth = lw
+            NSColor.labelColor.withAlphaComponent(0.25).setStroke()
+            track.stroke()
+            guard let rem = rem, rem > 2 else { return }
             let arc = NSBezierPath()
-            arc.appendArc(withCenter: c, radius: r, startAngle: 90,
-                          endAngle: 90 - 360 * CGFloat(min(1, frac)), clockwise: true)
+            arc.appendArc(withCenter: c, radius: radius, startAngle: 90,
+                          endAngle: 90 - 360 * CGFloat(min(1, rem / 100)), clockwise: true)
             arc.lineWidth = lw
             arc.lineCapStyle = .round
-            color.setStroke()
+            NSColor.labelColor.setStroke()
             arc.stroke()
         }
+        let outerR = (size - lw) / 2
+        ring(outerR, outerRem)            // 外环：周限额
+        ring(outerR - lw - 1, innerRem)   // 内环：Fable（留 1pt 缝隙防糊成一团）
         return true
     }
 }
@@ -501,24 +508,23 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
-    // 菜单栏标题: 每账户 = 余量圆环(图形) + 距重置时间(文字主角)，如 "◔ 5d  ◑ 21h"
-    // 环默认单色 labelColor（菜单栏惯例：壁纸把栏染成什么色都清晰），左 A 右 B 靠位置区分；
-    // 颜色只在有含义时出现：剩≤30% 橙、≤10% 红
+    // 菜单栏标题: 每账户 = 余量同心双环(外=周限额, 内=Fable) + 距重置时间(文字主角)，如 "◔ 5d  ◑ 21h"
+    // 左 A 右 B 靠位置区分
     func render() {
         let snaps = store.snapshot()
         let title = NSMutableAttributedString()
         for (i, s) in snaps.enumerated() {
             if i > 0 { title.append(NSAttributedString(string: "  ")) }
-            let blk = s.fable ?? s.weekly   // 整块选桶：pct 和重置时间必须来自同一个桶，不按字段各取各的
-            let rem = effectiveRem(blk)
-            var ringCol = NSColor.labelColor
-            if let r = rem, r <= 30 { ringCol = r <= 10 ? .systemRed : .systemOrange }
+            let remW = effectiveRem(s.weekly)
+            let remF = effectiveRem(s.fable)
             let att = NSTextAttachment()
-            att.image = ringImage(frac: (rem ?? 0) / 100.0, color: ringCol)
-            att.bounds = CGRect(x: 0, y: -2, width: 13, height: 13)
+            att.image = ringImage(outerRem: remW, innerRem: remF)
+            att.bounds = CGRect(x: 0, y: -3, width: 15, height: 15)
             title.append(NSAttributedString(attachment: att))
+            // 倒计时仍取 Fable 桶（缺失退回周）：文字和该桶的重置时间同源
             // 标题不放警标：闲置账户 token 过期是常态（数据照样够准），错误详情在菜单行/tooltip
-            if rem != nil {
+            let blk = s.fable ?? s.weekly
+            if (remF ?? remW) != nil {
                 title.append(seg(" \(tinyLeft(blk?.resetsEpoch))", .labelColor, 13, mono: true))
             } else {
                 title.append(seg(" —", .labelColor, 13))
