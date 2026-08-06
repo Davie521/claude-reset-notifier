@@ -15,7 +15,11 @@ case "${1:-}" in
 esac
 
 # set -u 挡得住 HOME 没定义，挡不住 HOME=""——那样下面几个路径会指到 /Library/…
-[ -n "${HOME:-}" ] && [ -d "$HOME" ] || { echo "HOME 没设好: '${HOME:-}'" >&2; exit 2; }
+# 写成 if 而不是 `A && B || C`：后者在 shellcheck 眼里是 SC2015，而且确实容易读错
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+    echo "HOME 没设好: '${HOME:-}'" >&2
+    exit 2
+fi
 
 UID_="$(id -u)"
 LABEL="com.yifan.claude-reset-menubar"

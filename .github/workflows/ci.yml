@@ -15,7 +15,7 @@ jobs:
     name: 编译（-warnings-as-errors）
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: 版本信息
         run: swiftc --version && xcodebuild -version
       # -warnings-as-errors 是有意的：这个文件靠大量注释承载不变量，
@@ -30,7 +30,7 @@ jobs:
     name: install.sh 静态检查
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: 语法
         run: bash -n install.sh
       - name: shellcheck
