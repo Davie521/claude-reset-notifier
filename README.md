@@ -46,10 +46,10 @@ macOS 菜单栏小组件：监控两个 Claude 账户的 **Fable 周容量**和*
 
 ```bash
 swiftc -O -warnings-as-errors menubar/ClaudeReset.swift -o /tmp/crn -framework Cocoa   # 编译
-shellcheck install.sh                                                                  # 脚本静态检查
+bash -n install.sh && shellcheck install.sh                                            # 脚本语法 + 静态检查
 ```
 
-CI（`.github/workflows/ci.yml`）在 PR 和 main 上跑的就是这两件事，macOS runner 编译、Linux runner 跑 shellcheck。
+CI（`.github/workflows/ci.yml`）在 PR 和 main 上跑的就是这些，macOS runner 编译、Linux runner 跑脚本检查。
 
 注意本机 shellcheck 可能比 runner 上的宽松（装 0.11.0 时踩过：本地全绿、CI 报 SC2015）。改完 `install.sh` 推之前用同源镜像复核一遍更省事：
 
