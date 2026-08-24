@@ -1,8 +1,10 @@
 #!/bin/bash
-# 编译并安装 claude-reset 菜单栏 App（LaunchAgent 常驻，登录自启）。
+# SPDX-License-Identifier: Apache-2.0
+# 编译并安装 Claude Reset Notifier 菜单栏 App（LaunchAgent 常驻，登录自启）。
 # 二进制 + state.json + 日志放 ~/Library/Application Support/claude-reset/，
-# 不直接从仓库目录跑：Desktop 是 TCC 保护目录，launchd 后台进程在里面读写不稳。
-# 用法: ./install.sh [--force]   --force 跳过 Homebrew 版共存检查
+# 不直接从仓库目录跑：仓库很可能落在 Desktop / Documents 这类 TCC 保护目录下，
+# launchd 后台进程在里面读写不稳。
+# 用法: ./install.sh [--force]   --force 跳过旧 Homebrew 版共存检查
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -22,7 +24,10 @@ if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
 fi
 
 UID_="$(id -u)"
-LABEL="com.yifan.claude-reset-menubar"
+LABEL="io.github.davie521.claude-reset-menubar"
+# 开源改名前用的是 com.yifan.*。留着做迁移：老实例不关掉就是两个图标、双倍请求、
+# 两个进程整体重写同一个 state.json（互相抹掉退避窗口）。
+LEGACY_LABEL="com.yifan.claude-reset-menubar"
 BREW_LABEL="homebrew.mxcl.claude-reset-notifier"
 RUNTIME="$HOME/Library/Application Support/claude-reset"
 AGENTS="$HOME/Library/LaunchAgents"
@@ -33,15 +38,16 @@ BIN="$RUNTIME/claude-reset-menubar"
 cleanup() { rm -f "$PLIST.new" "$BIN.new"; }
 trap cleanup EXIT
 
-# Homebrew 版和这一份互斥：同时跑会出现两个菜单栏图标、双倍请求把 usage 接口打限流，
+# 旧的 Homebrew 版（私有 tap，已废弃）和这一份互斥：同时跑会出现两个菜单栏图标、
+# 双倍请求把 usage 接口打限流，
 # 而且两个进程都整体重写同一个 state.json，会互相抹掉对方的退避窗口——恰恰在最需要
 # 退避的时候失效。bootout 只认自己的 label，认不出 brew 的，所以要显式查。
 # 直接问这一个 label，而不是 grep 整份 `launchctl print gui/UID`：那份 dump 里还有一段
 # disabled services，会留下早就不存在的服务名，grep 它会永久误报且用户无法解除。
 if [ "$FORCE" -eq 0 ] \
    && { launchctl print "gui/$UID_/$BREW_LABEL" >/dev/null 2>&1 || [ -f "$AGENTS/$BREW_LABEL.plist" ]; }; then
-    echo "检测到 Homebrew 版（$BREW_LABEL 已注册或正在运行）。" >&2
-    echo "先跑 brew services stop davie521/tap/claude-reset-notifier，或用 ./install.sh --force 强装。" >&2
+    echo "检测到旧的 Homebrew 版（$BREW_LABEL 已注册或正在运行）。" >&2
+    echo "先把它 stop 掉（brew services stop claude-reset-notifier），或用 ./install.sh --force 强装。" >&2
     exit 1
 fi
 
@@ -100,6 +106,14 @@ mv -f "$PLIST.new" "$PLIST" || { echo "写入 $PLIST 失败，旧实例未动。
 # 那样会“看起来成功了、其实还在跑旧定义”。
 # bootout 的失败这里确实咽掉了，因为首次安装必然失败（没有这个服务）；真出问题的话，
 # 下面的 bootstrap 会带着 launchd 自己的报错失败，不会被蒙混过去。
+# 先送走改名前的老实例，再换代。放在这里而不是脚本开头，是为了守住上面那条顺序：
+# 任何可能失败的事都做完了，到这一步才碰正在跑的进程。老 plist 指向的二进制路径和新的
+# 一样（$BIN），刚被 mv 覆盖过，所以必须连 plist 一起删掉——留着它下次登录会再拉起
+# 一个跑同一个二进制的第二实例。
+if [ "$LEGACY_LABEL" != "$LABEL" ]; then
+    launchctl bootout "gui/$UID_/$LEGACY_LABEL" 2>/dev/null || true
+    rm -f "$AGENTS/$LEGACY_LABEL.plist"
+fi
 launchctl bootout "gui/$UID_/$LABEL" 2>/dev/null || true
 ok=0
 err=""

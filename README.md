@@ -1,80 +1,245 @@
 # Claude Reset Notifier
 
-macOS 菜单栏小组件：监控两个 Claude 账户的 **Fable 周容量**和**周限额**（剩余 % + 重置倒计时）。无后端、无依赖，一个 Swift 文件编译成单二进制。
+[![CI](https://github.com/Davie521/claude-reset-notifier/actions/workflows/ci.yml/badge.svg)](https://github.com/Davie521/claude-reset-notifier/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-## 显示
+**[中文文档](README.zh-CN.md)**
 
-信息密度优先，时间是主角。菜单栏标题每账户 = 一个余量同心双环 + 距重置时间，形如 `◔ 5d  ◑ 21h`（环是自绘的图，这里只是示意，并不是这两个字符）：
+A macOS menu bar widget that answers one question at a glance: *how much Claude quota is
+left, and when does it reset* — for two accounts at once.
 
-- **外环 = 周限额剩余，内环 = Fable 剩余**，填充比例即剩余量；环全程单色（随菜单栏深浅自动黑/白，壁纸染色下也清晰），不做橙/红警示——额度本来就是拿来用完的，剩得少是常态不是事故，环只当油量表
-- 左边永远是账户 A、右边是 B
-- 重置时刻一过按"额度已恢复"显示（环回满、时间处显示 ✓）
+No backend, no dependencies, no package manager. One Swift file compiled into a single
+binary that runs as a LaunchAgent.
 
-点开后每账户一行（悬停可看重置时刻、数据年龄、错误详情；出错时账户字母旁有小 ⚠，继续显示缓存数据）：
+> Unofficial. Not affiliated with or endorsed by Anthropic. It reads the same
+> `/api/oauth/usage` endpoint the Claude Code CLI uses — an undocumented internal API that
+> can change or disappear without notice. See [Caveats](#caveats).
+
+## What it shows
+
+Information density first, with time as the headline. The menu bar title renders one
+concentric ring plus a reset countdown per account — something like `◔ 5d  ◑ 21h` (the
+rings are drawn, those two characters are just an illustration):
+
+- **Outer ring = weekly all-model limit remaining. Inner ring = Fable weekly capacity
+  remaining.** Fill ratio *is* the remaining percentage.
+- The rings are monochrome throughout — they follow `labelColor`, so they stay legible on
+  light and dark menu bars and on wallpaper-tinted ones. There is deliberately no
+  orange/red warning state: quota is meant to be spent, so "not much left" is the normal
+  case, not an incident. The ring is a fuel gauge, not an alarm.
+- Account A is always on the left, B on the right.
+- Once a reset time passes, the account switches to "restored": ring full, countdown
+  replaced by ✓.
+
+Click for one row per account. Hover a row for the absolute reset time, data age, and
+error detail. A failing account gets a small ⚠ next to its letter and **keeps showing its
+last good numbers**:
 
 ```
 ● A⚠   Fable 剩97%   周 剩97%       6天后重置
 ● B    Fable 剩45%   周 剩64%    20时47分后重置
+        │              │                │
+        │              │                └─ time until reset
+        │              └─ weekly all-model limit remaining
+        └─ Fable weekly capacity remaining
 ```
 
-在用账户 = 实色点 + 全亮字；闲置账户 = 半透明点 + 灰字。「退出」真正退出（LaunchAgent 只在崩溃时自动拉起，登录时自启）。
+The account currently in use gets a solid dot and full-brightness text; the idle one gets
+a translucent dot and grey text. "Quit" really quits — the LaunchAgent only relaunches on
+a crash, and starts the app at login.
 
-## 工作方式
+> **The in-app UI is currently Chinese-only.** Every string lives in one file
+> (`menubar/ClaudeReset.swift`) and is not localized yet; an English localization is a
+> welcome contribution. The README, code comments and install script explain everything
+> the UI says.
 
-- 从 macOS 钥匙串**只读**取两个账户的 Claude Code OAuth token（绝不刷新，不会把 Claude Code 挤下线）
-- 背景轮询极懒：每 30 分钟调一次 `api.anthropic.com/api/oauth/usage`，每次只拉一个账户、两账户轮流（**单账户 1 小时一次**）。这个接口限流极紧——实测持续每分钟 1 个请求都会 429
-- 周限额取 `limits[]` 里 `kind=weekly_all`，Fable 取 `kind=weekly_scoped`（`scope.model.display_name=Fable`；名字匹配不上就留空，不拿别的模型的桶冒充）
-- 调度按"上次尝试时间"轮转（不论成败），一个账户持续失败（如闲置账户 token 过期）不会饿死另一个账户的刷新
-- 三道闸门决定什么时候真发请求：单账户最小间隔 **5 分钟**；打开菜单时被选账户数据超过 **25 分钟**旧才顺带补拉；手动刷新 **5 分钟**一次
-- 失败按账户独立退避 5→10→20…分钟（上限 1 小时），429 另取 `Retry-After` 的较大者并加 60 秒全局冷却。一个账户被限流不影响另一个
-- 「立即刷新」尊重服务器给的 429 窗口和全局冷却（连点也砸不穿），只越过我们自己给本地错误加的软退避——跑完 `claude` 刷新了 token 就能立刻验证。被闸门挡住时菜单项直接置灰并写明还要等多久，不会点了没反应
-- 拉取失败期间继续显示上次成功的数据、账户字母旁挂 ⚠，不清空
-- 快照、退避窗口、最近一次错误、上次尝试时间一起落盘 `state.json`：重启立刻有数据，不会无视还在生效的 `Retry-After`，也不会把失败账户的陈旧数字装成刚拉到的
+## How it works
 
-## 设计取舍
+- Reads the Claude Code OAuth token for each account from the macOS Keychain,
+  **read-only**. It never refreshes or writes a token, so it can't knock the Claude Code
+  CLI out of its session. Nothing is sent anywhere except `api.anthropic.com`.
+- Background polling is deliberately lazy: one call to `api.anthropic.com/api/oauth/usage`
+  every 30 minutes, fetching **one account per tick**, alternating — so **one request per
+  account per hour**. This endpoint is rate-limited hard: a sustained 1 request/minute
+  still earns a 429.
+- The weekly limit comes from the `limits[]` entry with `kind=weekly_all`; the Fable
+  bucket from `kind=weekly_scoped` whose `scope.model.display_name` matches "Fable". If no
+  bucket matches by name it is left empty rather than borrowing some other model's bucket.
+- Scheduling rotates on *last attempt time* regardless of success, so one persistently
+  failing account (an idle account with an expired token, say) can never starve the other
+  account's refresh.
+- Three gates decide when a request actually goes out: a **5 minute** minimum interval per
+  account; opening the menu only triggers a fetch if the selected account's data is more
+  than **25 minutes** old; manual refresh is throttled to once per **5 minutes**.
+- Failures back off per account: 5 → 10 → 20 … minutes, capped at 1 hour. A 429 takes the
+  larger of that and the server's `Retry-After`, and adds a 60 second global cooldown. One
+  account being rate-limited does not gate the other.
+- **Refresh now** respects the server's 429 window and the global cooldown — mashing it
+  can't punch through — but does skip the soft backoff we added ourselves for local
+  errors, so you can re-run `claude` to refresh a token and verify immediately. When a
+  gate blocks it, the menu item greys out and says how long is left, instead of doing
+  nothing when clicked.
+- While a fetch is failing the last successful numbers stay on screen with a ⚠ next to the
+  account letter. Nothing is cleared.
+- The snapshot, backoff window, last error and last attempt time are all persisted to
+  `state.json`: data is on screen immediately after a restart, a still-valid `Retry-After`
+  is not ignored, and a failed account's stale numbers are never dressed up as fresh.
 
-几条不显眼但改代码时容易踩掉的约束。每条在 `menubar/ClaudeReset.swift` 里都有对应的长注释写清了来龙去脉，这里只列结论。
+## Design trade-offs
 
-- **空数据绝不覆盖缓存。** 判空落在界面真正显示的百分比上，不是只看桶在不在——一个「只剩 `resets_at` 的空壳桶」会当成功把准数字盖掉。字段改名、变成字符串、变成 JSON 布尔、本来有值的桶整块消失，都算失败（新装机器上没有 Fable 桶则是正常的）
-- **但保护缓存不能把账户焊死。** 同一形状连续拒收 5 次（`PARSE_GIVE_UP`，配合退避阶梯约 2 小时）就认下新结构，**前提是它还带着至少一个百分比**——一份什么都没有的响应永远不是「新常态」。少了这个前提，这条通道等于给"清空缓存"开一张延迟两小时的支票
-- **两条崩溃循环入口必须堵死。** 非有限数值在入口丢弃（`-1e400` 会被 `JSONSerialization` 静静解析成 `-inf`，正向的 `1e400` 反而抛错），外来秒数转 `Int` 前一律先夹住（Swift 的 `Int(Double)` 越界是 trap 不是溢出）。进程一 abort，`KeepAlive` 就会拉起来重读同一份数据再崩，用户只能手删 `state.json` 才脱身
-- **所有请求闸门按单调时钟计时**，改系统时间不会把轮询永久锁死。唯一按墙钟算的是「数据多旧」（它要跨重启），时钟往回调时按"旧"处理，只会多拉不会静默跳过
-- **界面时钟和主线程回调走 common runloop 模式。** 菜单跟踪期间主 runloop 跑的是 `NSEventTrackingRunLoopMode`，默认模式的 `Timer` 一次都不触发，而菜单开着恰恰是唯一需要就地更新的窗口
-- **菜单只建一次、就地更新**，不从异步回调里 `removeAllItems`——那会把鼠标底下的 item 在按下和抬起之间换掉
+A handful of constraints that aren't obvious and are easy to break while editing. Each has
+a long comment at the corresponding place in `menubar/ClaudeReset.swift` explaining the
+history; only the conclusions are listed here.
 
-## 开发
+- **Empty data must never overwrite the cache.** The emptiness check lands on the
+  percentage the UI actually displays, not merely on whether a bucket exists — a hollow
+  bucket carrying only `resets_at` would otherwise sail down the success path and paint
+  over good numbers. A renamed field, a value that turned into a string, a JSON boolean,
+  or a previously populated bucket vanishing entirely all count as failure. (A machine
+  that legitimately has no Fable bucket is fine — that's not a loss.)
+- **But protecting the cache must not weld the account shut.** After the same shape is
+  rejected `PARSE_GIVE_UP` (5) times in a row — roughly 2 hours once the backoff ladder is
+  factored in — the new structure is accepted, **provided it still carries at least one
+  percentage**. A response containing nothing at all is never the "new normal". Without
+  that proviso this escape hatch would be a post-dated cheque for wiping the cache.
+- **Two crash-loop entry points are sealed.** Non-finite numbers are dropped at the door
+  (`-1e400` is quietly parsed as `-inf` by `JSONSerialization`, while a positive `1e400`
+  throws), and any externally-sourced number of seconds is clamped before `Int()`
+  conversion (out-of-range `Int(Double)` in Swift is a trap, not an overflow). Once the
+  process aborts, `KeepAlive` relaunches it, it re-reads the same data and crashes again —
+  the only way out for a user would be deleting `state.json` by hand.
+- **Every request gate is timed on the monotonic clock**, so changing the system clock
+  can't freeze polling forever. The single exception is "how old is this data", which has
+  to survive restarts and therefore uses the wall clock; a backwards clock jump is treated
+  as "old", which fetches more, never silently less.
+- **The UI clock and main-thread callbacks run in the common runloop mode.** While a menu
+  is tracking, the main runloop is in `NSEventTrackingRunLoopMode`, where a default-mode
+  `Timer` never fires once — and a menu being open is precisely the one window where
+  in-place updates matter.
+- **The menu is built once and updated in place**, never `removeAllItems` from an async
+  callback — that swaps the item under the cursor between mouse-down and mouse-up.
+
+## Configuration
+
+Accounts are compiled in, at the top of `menubar/ClaudeReset.swift`:
+
+```swift
+let ACCOUNTS = [
+    AcctCfg(id: "a", label: "A", keychain: "Claude Code-credentials"),
+    AcctCfg(id: "b", label: "B", keychain: "Claude Code-credentials-CHANGEME"),
+]
+```
+
+`keychain` is the Keychain **service name** where Claude Code stores that account's OAuth
+credentials. The first account uses the default `Claude Code-credentials`; every
+additional account you log into gets its own entry with a hash suffix that differs per
+user and per machine. Find yours with:
 
 ```bash
-swiftc -O -warnings-as-errors menubar/ClaudeReset.swift -o /tmp/crn -framework Cocoa   # 编译
-bash -n install.sh && shellcheck install.sh                                            # 脚本语法 + 静态检查
+security dump-keychain | grep 'Claude Code-credentials'
 ```
 
-CI（`.github/workflows/ci.yml`）在 PR 和 main 上跑的就是这些，macOS runner 编译、Linux runner 跑脚本检查。
+Getting it wrong is not fatal — that row shows "no such credential in the Keychain" and
+the other account keeps working. Then re-run `./install.sh` to rebuild and reload.
 
-注意本机 shellcheck 可能比 runner 上的宽松（装 0.11.0 时踩过：本地全绿、CI 报 SC2015）。改完 `install.sh` 推之前用同源镜像复核一遍更省事：
+- **One account:** delete the second line.
+- **Three or more:** it works (dot colours cycle), but two things need attention — the
+  menu bar title grows one ring group per account, and the footer string "polls once per
+  hour per account" is hard-coded for 2 accounts × `POLL_SEC` (30 min). Change both.
+- **Which account is "in use"** is read from `~/.claude-current-acct`, a file containing
+  just `a` or `b`. It only drives the solid-vs-translucent dot; if the file is absent,
+  account `a` is assumed. Write it from whatever you use to switch accounts.
+- The tracked scoped model is matched by display name containing "Fable"
+  (`UsageStore.parseUsage`). Change that string to track a different model's weekly
+  bucket — and the `"Fable"` UI label alongside it.
 
-```bash
-docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable install.sh
-```
-
-## 安装
+## Install
 
 ```bash
 ./install.sh
 ```
 
-要求：装了 Xcode Command Line Tools（用 `swiftc` 从源码编译）。
+Requires Xcode Command Line Tools (`swiftc` compiles from source). No Homebrew, no
+runtime dependencies.
 
-编译后装到 `~/Library/Application Support/claude-reset/` 并注册 LaunchAgent `com.yifan.claude-reset-menubar`（登录自启；内部标识沿用 claude-reset，改名不迁移运行时）。运行时文件不放仓库目录（Desktop 是 TCC 保护路径，launchd 后台进程在里面读写不稳）。状态文件在 `~/Library/Application Support/claude-reset/state.json`。
+The script compiles the binary, installs it to
+`~/Library/Application Support/claude-reset/` and registers the LaunchAgent
+`io.github.davie521.claude-reset-menubar` (starts at login; `KeepAlive` only relaunches on
+a crash). Runtime files deliberately live outside the repo directory: repos tend to sit
+under `~/Desktop` or `~/Documents`, which are TCC-protected paths where a launchd
+background process can't reliably read and write. State lives in
+`~/Library/Application Support/claude-reset/state.json`, logs in `menubar.log` next to it.
 
-以前还有一条 Homebrew 私有 tap 的安装路径，已废弃（`davie521/homebrew-tap` 已删除）。`install.sh` 里仍保留对它的互斥检查：检测到 `homebrew.mxcl.claude-reset-notifier` 已注册或其 plist 还在就拒绝安装 —— 两份同时跑会出现两个图标、把 usage 接口打限流，还会互相覆盖 `state.json` 里的退避窗口。老机器上有残留而你确认不用管它，用 `./install.sh --force` 强装。
+The order inside `install.sh` is the interesting part: everything that can fail — making
+directories, compiling, writing the plist, moving files into place — happens *before* the
+running instance is touched. Any failure leaves you with "the old one is still running,
+the new one didn't take effect", never "the old one is unloaded and the new one isn't
+installed".
 
-账户配置在 `menubar/ClaudeReset.swift` 顶部 `ACCOUNTS`；keychain service 名用 `security dump-keychain | grep 'Claude Code-credentials'` 查。当前在用账户的标记读 `~/.claude-current-acct`（内容 `a` 或 `b`）。
+Two legacy paths it still guards:
 
-## 卸载
+- The app used to be installed under the label `com.yifan.claude-reset-menubar`. If that
+  agent is still registered, `install.sh` boots it out and removes its plist before
+  loading the new one — otherwise you'd get two icons, double the requests, and two
+  processes rewriting the same `state.json` and erasing each other's backoff windows.
+- There was also a private Homebrew tap; it's gone. `install.sh` still refuses to install
+  if `homebrew.mxcl.claude-reset-notifier` is registered or its plist is lying around, for
+  the same coexistence reasons. Use `./install.sh --force` to install anyway.
+
+## Uninstall
 
 ```bash
-launchctl bootout gui/$(id -u)/com.yifan.claude-reset-menubar
-rm ~/Library/LaunchAgents/com.yifan.claude-reset-menubar.plist
+launchctl bootout gui/$(id -u)/io.github.davie521.claude-reset-menubar
+rm ~/Library/LaunchAgents/io.github.davie521.claude-reset-menubar.plist
 rm -rf ~/Library/Application\ Support/claude-reset
 ```
+
+If you ever ran a build from before the rename, clean up the old label too:
+
+```bash
+launchctl bootout gui/$(id -u)/com.yifan.claude-reset-menubar 2>/dev/null
+rm -f ~/Library/LaunchAgents/com.yifan.claude-reset-menubar.plist
+```
+
+Nothing else is left behind — the app writes only inside its own Application Support
+directory and never modifies the Keychain.
+
+## Development
+
+```bash
+swiftc -O -warnings-as-errors menubar/ClaudeReset.swift -o /tmp/crn -framework Cocoa  # build
+bash -n install.sh && shellcheck install.sh                                           # script checks
+```
+
+That's exactly what CI (`.github/workflows/ci.yml`) runs on pull requests and on `main`:
+compile on a macOS runner, script checks on a Linux runner. `-warnings-as-errors` is
+intentional — this file carries its invariants in long comments, and a new warning usually
+means someone dislodged something.
+
+A locally installed shellcheck may be more lenient than the runner's (seen with 0.11.0:
+green locally, SC2015 in CI). Cross-check against the same image before pushing:
+
+```bash
+docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable install.sh
+```
+
+## Caveats
+
+- **`/api/oauth/usage` is an internal, undocumented endpoint.** It can change shape or go
+  away at any time. The parser is built to fail loudly-but-safely when it does (keep the
+  cache, show ⚠), and to adapt after 5 consecutive rejections — but a removed endpoint is
+  a removed endpoint.
+- **It is rate-limited aggressively.** If you fork this and make it poll faster, you will
+  get 429s. The default cadence — one request per account per hour — is the point.
+- Reading the Keychain may raise an authorisation prompt the first time (the app waits up
+  to 45 seconds for you to click it). Grant "Always Allow" to avoid repeats.
+- macOS only, Apple silicon and Intel alike; no signing or notarisation, since you compile
+  it yourself.
+- The app never refreshes tokens. When one expires, that row says so — run `claude` to
+  refresh, then hit "Refresh now".
+
+## License
+
+[Apache-2.0](LICENSE). You may use, modify and redistribute it, including commercially;
+in return the license asks you to keep the copyright and [NOTICE](NOTICE), and to state
+prominently in any modified files that you changed them.

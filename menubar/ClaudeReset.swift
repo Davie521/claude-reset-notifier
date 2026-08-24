@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // Claude Reset Notifier —— Claude 双账户重置监控，无后端单体版
 // 一个菜单栏 App 干完所有事：读钥匙串 → 拉 Anthropic 用量 → 菜单栏展示。
 // 只关注两件事：周限额(用量+重置时间) 和 Fable 周容量(用量+重置时间)。
@@ -26,10 +27,19 @@
 import Cocoa
 
 // ---- 配置 ----
-struct AcctCfg { let id: String; let label: String; let email: String; let keychain: String }
+// 账户写死在这里：这是个单文件工具，改完重跑 ./install.sh 就生效。
+// keychain = Claude Code 存 OAuth 凭据用的钥匙串 service 名。第一个账户是默认的
+// "Claude Code-credentials"；之后每多登一个账户，Claude Code 会另存一条带哈希后缀的
+// （形如 "Claude Code-credentials-1a2b3c4d"，后缀因人因机而异，必须自己查）：
+//     security dump-keychain | grep 'Claude Code-credentials'
+// 填错或那条凭据不存在不会崩，那一行显示"钥匙串里没有这条凭据"，另一个账户照常跑。
+// 只有一个账户就删掉第二行；三个以上也能跑（点的颜色会循环用），但两处要一起改：
+// 菜单栏每个账户画一组环，横着排会很长；页脚那句"后台每小时轮询一次/账户"是按
+// 2 账户 × POLL_SEC(30 分钟) 算死的，账户数一变它就成了假话。
+struct AcctCfg { let id: String; let label: String; let keychain: String }
 let ACCOUNTS = [
-    AcctCfg(id: "a", label: "A", email: "account-a@example.com", keychain: "Claude Code-credentials"),
-    AcctCfg(id: "b", label: "B", email: "account-b@example.com", keychain: "Claude Code-credentials-CHANGEME"),
+    AcctCfg(id: "a", label: "A", keychain: "Claude Code-credentials"),
+    AcctCfg(id: "b", label: "B", keychain: "Claude Code-credentials-CHANGEME"),
 ]
 let USAGE_URL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let BETA_HEADER = "oauth-2025-04-20"

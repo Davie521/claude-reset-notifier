@@ -5,33 +5,33 @@ on:
     branches: [main]
   pull_request:
 
-# 同一分支上新的推送把旧的跑掉，省 macOS runner 的分钟数（私有仓库 10 倍计费）
+# 同一分支上新的推送把旧的跑掉，省 macOS runner 的分钟数
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   swift:
-    name: 编译（-warnings-as-errors）
+    name: build (-warnings-as-errors)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
-      - name: 版本信息
+      - name: toolchain versions
         run: swiftc --version && xcodebuild -version
       # -warnings-as-errors 是有意的：这个文件靠大量注释承载不变量，
       # 多出来的警告通常意味着有人改动时碰掉了什么
-      - name: 编译
+      - name: compile
         run: |
           swiftc -O -warnings-as-errors menubar/ClaudeReset.swift \
             -o "$RUNNER_TEMP/claude-reset-menubar" -framework Cocoa
           test -x "$RUNNER_TEMP/claude-reset-menubar"
 
   shell:
-    name: install.sh 静态检查
+    name: shellcheck install.sh
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: 语法
+      - name: bash -n
         run: bash -n install.sh
       - name: shellcheck
         run: shellcheck install.sh
