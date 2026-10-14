@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Claude Reset Notifier —— Claude 双账户重置监控，无后端单体版
+// Claude Reset Notifier —— Claude 多账户重置监控，无后端单体版
 // 一个菜单栏 App 干完所有事：读钥匙串 → 拉 Anthropic 用量 → 菜单栏展示。
-// 只关注两件事：周限额(用量+重置时间) 和 Fable 周容量(用量+重置时间)。
+// 关注三件事：周限额、Fable 周容量（各含用量 + 重置时间），以及只在下拉菜单里显示的 5 小时窗口。
 // robust 设计：
-//   - 背景轮询极懒：每 30 分钟只拉一个账户，两账户轮流（单账户 1 小时一次）；
+//   - 背景轮询极懒：每 30 分钟只拉一个账户，各账户轮流（N 个账户则每个 N×30 分钟一次）；
 //     打开菜单时被选账户数据超过 25 分钟旧才顺带补拉，手动刷新 5 分钟一次
 //     （usage 接口限流极紧：实测持续 1 请求/分钟仍会 429，务必保持低频。
-//      手动刷新一次打两个请求，节流给短了连点就能把总量推到 200+ 请求/小时）
+//      手动刷新一次每个账户打一个请求，节流给短了连点就能把总量推到 200+ 请求/小时）
 //   - 所有请求闸门都按单调时钟计时：用户改表 / NTP 大幅校正不会把轮询永久锁死
 //   - 429 按账户独立退避：max(Retry-After, 5→10→20…分钟, 上限1小时)，另有 60s 全局冷却；
 //     非 429 的失败（token 过期 / 网络 / 5xx）也退避，否则坏账户每轮都吃掉唯一的拉取名额
@@ -25,25 +25,78 @@
 //     跟踪模式，实测送达率也是 100%，走稳的那条
 // 安装: 仓库根目录跑 ./install.sh（编译 + 装到 ~/Library/Application Support/claude-reset + 注册 LaunchAgent）
 import Cocoa
+import CryptoKit
 
 // ---- 配置 ----
-// 账户写死在这里：这是个单文件工具，改完重跑 ./install.sh 就生效。
-// keychain = Claude Code 存 OAuth 凭据用的钥匙串 service 名。第一个账户是默认的
-// "Claude Code-credentials"；之后每多登一个账户，Claude Code 会另存一条带哈希后缀的
-// （形如 "Claude Code-credentials-1a2b3c4d"，后缀因人因机而异，必须自己查）：
-//     security dump-keychain | grep 'Claude Code-credentials'
-// 填错或那条凭据不存在不会崩，那一行显示"钥匙串里没有这条凭据"，另一个账户照常跑。
-// 只有一个账户就删掉第二行；三个以上也能跑（点的颜色会循环用），但两处要一起改：
-// 菜单栏每个账户画一组环，横着排会很长；页脚那句"后台每小时轮询一次/账户"是按
-// 2 账户 × POLL_SEC(30 分钟) 算死的，账户数一变它就成了假话。
-struct AcctCfg { let id: String; let label: String; let keychain: String }
-let ACCOUNTS = [
-    AcctCfg(id: "a", label: "A", keychain: "Claude Code-credentials"),
-    AcctCfg(id: "b", label: "B", keychain: "Claude Code-credentials-CHANGEME"),
-]
+// 账户自动发现，不用改源码：Claude Code 每个配置目录在钥匙串里存一条 OAuth 凭据——默认目录
+// ~/.claude 是 "Claude Code-credentials"，其他目录（用 CLAUDE_CONFIG_DIR 指过去的）是
+// "Claude Code-credentials-" + sha256(目录绝对路径) 的前 8 位（2026-10-14 在三个目录上核对过）。
+// 所以扫 ~/.claude 和 ~/.claude-* 这些目录、只留钥匙串里真有凭据的：~/.claude 记作 A，
+// ~/.claude-b 记作 B，以此类推。~/.claude-mem 这类不是配置目录的，钥匙串里没有对应条目，自然被排除；
+// 反过来，钥匙串里有、目录已经删掉的孤儿条目也不会冒出来。
+// 只在启动时扫一次（菜单行数启动时就定了，见 render），新登一个账户后重启看板生效。
+// CLAUDE_CONFIG_DIR 指到 ~/.claude-* 以外的位置不会被发现。账户多了菜单栏会变长（每个约 50pt），
+// 刘海屏上放不下时系统会把整个图标藏起来；页脚的轮询间隔按账户数自动算，启动预热最多两个账户。
+struct AcctCfg { let id: String; let label: String; let keychain: String; var dir = "~/.claude" }
+
+// 钥匙串里有没有这条（只查属性、不取密码，不会弹授权框）。只有退出码 44（errSecItemNotFound）才算「没有」；
+// 其余失败（超时 / 起不了进程 / 钥匙串本身出错）返回 nil，调用方按「有」处理：多一行显示错误，
+// 好过把一个真账户悄悄藏掉——发现只在启动时做一次，藏掉了就一直藏到下次重启（Codex 2026-10-14）。
+func keychainHas(_ service: String) -> Bool? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-s", service]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    let sem = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in sem.signal() }
+    do { try p.run() } catch { return nil }
+    if sem.wait(timeout: .now() + 5) == .timedOut { p.terminate(); return nil }
+    switch p.terminationStatus {
+    case 0: return true
+    case 44: return false
+    default: return nil
+    }
+}
+
+// state.json 的键（也是 ~/.claude-current-acct 里写的那个字母）。必须只由这一个目录自己决定：
+// 按出现顺序加序号、或拿「已被占用」去挑，别的目录一增删，键就会漂、读到别人的额度和退避状态
+// （Codex 2026-10-14 两轮）。所以分成两套互不相交的名字：
+// - 后缀只含小写字母、数字、-、_ 且不是默认目录占着的 a：直接用后缀（b、c…，和以前手写配置时一致，老缓存直接接上）
+// - 其余（带大写、带别的符号、或就是 a）：用 "#" + 路径哈希前 8 位。普通键永远不含 #，两套不会撞
+func accountID(suffix: String, hash: String) -> String {
+    let plainOK = suffix != "a" && !suffix.isEmpty && suffix.unicodeScalars.allSatisfy {
+        ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" || $0 == "_"
+    }
+    return plainOK ? suffix : "#" + hash.prefix(8)
+}
+
+func discoverAccounts() -> [AcctCfg] {
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    // 默认目录 ~/.claude 也按钥匙串判断：只用 ~/.claude-work 这类目录的人不该看到一个不存在的 A，
+    // 还白占轮询名额（Codex 2026-10-14）。一个账户都找不到时在最后补回 A，让那一行告诉你「钥匙串里没有这条凭据」
+    let defaultAcct = AcctCfg(id: "a", label: "A", keychain: "Claude Code-credentials")
+    var out = (keychainHas(defaultAcct.keychain) ?? true) ? [defaultAcct] : []
+    let names = ((try? FileManager.default.contentsOfDirectory(atPath: home)) ?? [])
+        .filter { $0.hasPrefix(".claude-") && $0.count > ".claude-".count }
+        .sorted()
+    for name in names {
+        var isDir: ObjCBool = false
+        let path = home + "/" + name
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { continue }
+        let hex = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        let service = "Claude Code-credentials-" + hex.prefix(8)
+        guard keychainHas(service) ?? true else { continue }
+        let suffix = String(name.dropFirst(".claude-".count))
+        let id = accountID(suffix: suffix, hash: hex)
+        out.append(AcctCfg(id: id, label: suffix.uppercased(), keychain: service, dir: "~/" + name))
+    }
+    return out.isEmpty ? [defaultAcct] : out
+}
+let ACCOUNTS = discoverAccounts()
 let USAGE_URL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 let BETA_HEADER = "oauth-2025-04-20"
-let POLL_SEC: TimeInterval = 1800       // 定时节奏：每 tick 只拉一个账户，两账户轮流（单账户 1 小时一次）
+let POLL_SEC: TimeInterval = 1800       // 定时节奏：每 tick 只拉一个账户，各账户轮流（每个账户 N×30 分钟一次）
                                         // 周额度是慢变量，背景轮询宁懒勿勤
 let RENDER_SEC: TimeInterval = 30       // 界面时钟：只重画倒计时/环，不发任何请求
 let MENU_STALE_SEC: TimeInterval = 1500 // 打开菜单时被选账户数据比这旧才顺带触发一次拉取。
@@ -54,6 +107,9 @@ let FORCE_MIN_GAP: TimeInterval = 300   // 手动“立即刷新”最小间隔�
                                         // 一次强刷把所有账户都拉一遍，给 30 秒的话连点就是
                                         // 4 请求/分钟，是这个接口容忍度的四倍；周额度是慢变量，
                                         // 5 分钟一次手动刷新绰绰有余
+// 实际生效的手动刷新间隔：一次强刷每个账户一个请求，账户多了就按账户数放大（每个 100 秒），
+// 把手动刷新的总频率压在约 0.6 请求/分钟以内；三个账户时仍是 5 分钟（Codex 2026-10-14）
+let FORCE_GAP: TimeInterval = max(FORCE_MIN_GAP, 100 * Double(max(ACCOUNTS.count, 1)))
 let TICK_MIN_GAP: TimeInterval = 15     // 自动拉取去重间隔（定时器与菜单打开撞车时）
 let ACCT_MIN_GAP: TimeInterval = 300    // 非强刷时单账户最小尝试间隔（防频繁开菜单放大请求）
 let BACKOFF_MAX: TimeInterval = 3600    // 退避上限
@@ -95,7 +151,7 @@ let MONO_PAST = -TimeInterval.infinity   // 单调时钟里的 .distantPast
 let EPOCH_MAX: Double = 4e10             // 秒级时间戳的合理上界（公元 3237 年）。卡这么紧是因为
                                          // 重置时间最多几天之后，而 tooltip 的 "MM-dd HH:mm" 不带年份：
                                          // 放一个公元 99999 年的时间戳进来，只会显示成一个平平无奇的日期
-let ROW_W: CGFloat = 420                 // 账户行宽度 = 菜单宽度（见 AccountRowView）
+let ROW_W: CGFloat = 530                 // 账户行宽度 = 菜单宽度（见 AccountRowView）；2026-10-14 加 5 小时列，+110
 let FOOTER_MAX: CGFloat = 337            // 页脚文字宽度上限；超了就丢掉前半句，绝不把菜单顶宽。
                                          // 穷举现有措辞能生成的所有页脚，最宽 333.6pt，夹子取 337，
                                          // 实测这个宽度下菜单始终等于 ROW_W、不会被顶宽。
@@ -166,12 +222,26 @@ struct Block {
     }
 }
 
+// 一次拉取的结果。之前是 (周, Fable, 错误码, Retry-After, 5 小时) 的元组，加套餐类型时改成具名字段：
+// 六个位置靠 r.0…r.5 取，写错一位编译器也不会拦。
+struct FetchResult {
+    var weekly: Block? = nil
+    var fable: Block? = nil
+    var error: String? = nil        // nil = 成功
+    var retryAfter: Double? = nil   // 429 时服务器给的 Retry-After 秒数
+    var fiveHour: Block? = nil
+    var plan: String? = nil         // 钥匙串凭据里的 subscriptionType，和这次拉取成败无关
+    var credParsed = false          // 凭据 JSON 读成功了：此时 plan 为 nil 表示「凭据里就没这个字段」，可以清掉旧值
+}
+
 struct AcctSnap {
     var cfg: AcctCfg
     var active = false
     var error: String?       // 最近一次拉取的错误(nil=成功)；出错不清空旧数据，且跨重启保留
     var weekly: Block?       // 周限额(全模型)
     var fable: Block?        // Fable 周容量
+    var plan: String?        // 套餐类型：钥匙串凭据里的 subscriptionType（"max" / "pro" …），决定画不画 Fable
+    var fiveHour: Block?     // 5 小时窗口（只在下拉菜单行里显示；变化快，轮询又懒，数字可能旧，靠 tooltip 的数据年龄判断）
     var dataAt: Date?        // 数据成功拉到的时间（墙钟：要跨重启显示“数据多旧”）
     var attemptAt = MONO_PAST   // 上次尝试拉取（单调时钟，不论成败，调度按它轮转）
     var notBefore = MONO_PAST   // 该账户的退避闸门（单调时钟）
@@ -223,6 +293,8 @@ final class UsageStore {
             guard let e = obj[snaps[i].cfg.id] else { continue }
             snaps[i].weekly = Block.from(e["weekly"])
             snaps[i].fable = Block.from(e["fable"])
+            snaps[i].fiveHour = Block.from(e["five_hour"])
+            snaps[i].plan = e["plan"] as? String
             // at 同样要挡：非有限值会让之后每一次 saveState 都被 isValidJSONObject 拦下，
             // 落盘从此静默永久停摆；而一个「有限但离谱」的值（比如 -1e300）更糟——
             // 它一路活到页脚那句 Int(t / 86400)，直接 trap 掉整个进程
@@ -243,7 +315,7 @@ final class UsageStore {
             // 行里画着“周 剩50%”，页脚却写“暂无数据”，反过来则是行里“暂无数据”配
             // 页脚“最旧数据 12 分钟前”——两种都是自相矛盾
             if snaps[i].weekly == nil && snaps[i].fable == nil { snaps[i].dataAt = nil }
-            if snaps[i].dataAt == nil { snaps[i].weekly = nil; snaps[i].fable = nil }
+            if snaps[i].dataAt == nil { snaps[i].weekly = nil; snaps[i].fable = nil; snaps[i].fiveHour = nil }
             // 错误也要恢复：只恢复数据不恢复错误，重启后失败账户的陈旧数字会装成
             // 刚拉到的（无 ⚠、tooltip 无失败行），用户按一个几小时前的数字做决定
             snaps[i].error = e["error"] as? String
@@ -277,11 +349,12 @@ final class UsageStore {
             u.refreshing = refreshing
             // 年龄取最旧不取最新：页脚那句话盖在所有账户行上面，取最新会把
             // “B 两天没更新过”写成“更新于 刚刚”，直接骗人
-            u.oldestAge = snaps.compactMap { $0.dataAt }.min().map { max(0, -$0.timeIntervalSinceNow) }
-            u.missingData = snaps.contains { $0.dataAt == nil }
+            // 只算界面上真正显示得出来的数据：Pro 账户缓存里残留的 Fable 桶行里不显示，页脚也不能拿它报年龄
+            u.oldestAge = snaps.filter(hasShownData).compactMap { $0.dataAt }.min().map { max(0, -$0.timeIntervalSinceNow) }
+            u.missingData = snaps.contains { $0.dataAt == nil || !hasShownData($0) }
             // 退避情况：最快多久有账户能恢复，以及是不是全都被关着。
             // 只报“全部”是不够的——一个账户被关一小时、另一个健康时，页脚照样会理直气壮
-            // 写“后台每小时轮询一次/账户”，那对被关着的那个来说是假话。
+            // 写“后台每 N 分钟轮询一次/账户”，那对被关着的那个来说是假话。
             let waits = snaps.map { max(0, $0.notBefore - mono) }
             if let soonest = waits.filter({ $0 > 0 }).min() {
                 u.gated = soonest
@@ -289,7 +362,7 @@ final class UsageStore {
             }
             // 手动刷新真正可用还要多久：三道闸门取最大（自身节流 / 全局冷却 / 全部账户
             // 都卡在服务器给的 429 窗口里）。菜单项据此置灰并写明时间，别让用户点了没反应。
-            var wait = max(FORCE_MIN_GAP - (mono - lastForce), globalCooldown - mono)
+            var wait = max(FORCE_GAP - (mono - lastForce), globalCooldown - mono)
             let open = snaps.indices.filter { !(snaps[$0].rateLimited && mono < snaps[$0].notBefore) }
             if open.isEmpty, let soonest = snaps.map({ $0.notBefore - mono }).min() {
                 wait = max(wait, soonest)
@@ -309,14 +382,17 @@ final class UsageStore {
         stateQ.sync {
             if refreshing { return }
             if force {
-                if mono - lastForce < FORCE_MIN_GAP { return }
+                if mono - lastForce < FORCE_GAP { return }
                 // 全局冷却也要认。刚有账户吃到 429，就说明这个端点（同一个 IP）正在
                 // 拒人，此时去打另一个账户只是换个 token 撞同一堵墙。
                 if mono < globalCooldown { return }
                 // 服务器明确说了要等（429/Retry-After）就必须等——这是最容易被连点
                 // 砸穿的一条路径；我们自己给 401/网络错误加的软退避则可以越过，
                 // 否则用户跑完 `claude` 刷新了 token 也得干等一小时。
+                // 按上次尝试从旧到新排：批次遇到 429 会中途停下，固定按 A、B、C 的顺序的话，一个持续 429 的
+                // 账户每次都排第一、每次都把整批停掉，后面的账户永远轮不到（Codex 2026-10-14）
                 targets = snaps.indices.filter { !(snaps[$0].rateLimited && mono < snaps[$0].notBefore) }
+                    .sorted { snaps[$0].attemptAt < snaps[$1].attemptAt }
                 if targets.isEmpty { return }
                 lastForce = mono
             } else {
@@ -338,7 +414,9 @@ final class UsageStore {
             }
             refreshing = true
             lastAttempt = mono
-            for i in targets { snaps[i].attemptAt = mono }
+            // 只给第一个记「已尝试」；批里后面的账户在 doRefresh 里真去拉之前才记——批次可能中途因 429 停下，
+            // 没拉的不能算尝试过（Codex 2026-10-14）
+            if let first = targets.first { snaps[first].attemptAt = mono }
         }
         guard !targets.isEmpty else { return }
         onMainCommon { self.onUpdate?() }   // 立刻把“刷新中”反映到界面（菜单开着也要生效）
@@ -347,25 +425,40 @@ final class UsageStore {
 
     private func doRefresh(_ idxs: [Int], force: Bool) {
         // 串行，避免同瞬间双请求。每个账户一出结果就提交并回调，不憋到整批结束：
-        // 单账户最坏 45s(钥匙串) + 15s(网络)，两个账户就是两分钟界面纹丝不动。
+        // 单账户最坏 45s(钥匙串) + 15s(网络)，N 个账户就是 N 分钟界面纹丝不动。
         // refreshing 仍然覆盖整个循环，这是有意的——这段时间里进来的 tick 就该被吞掉，
         // 而不是叠上第二批请求；代价（吞掉一次菜单打开的补拉）由“刷新中…”明说出来。
         // attemptAt 已经在 tick 里记下了，但只记在内存里。先落一次盘再去拉：
         // 下面这段最坏能卡 60 秒（45s 钥匙串 + 15s 网络），崩在里面的话这次尝试就没了，
         // 重启回来又是一次不受节流的请求——崩溃循环下就是每分钟好几个。
         saveState()
-        for i in idxs {
+        for (n, i) in idxs.enumerated() {
+            if n > 0 {
+                // 强刷一批拉多个账户：每拉下一个之前先看全局冷却——前一个刚吃了 429，这个端点正在拒人，
+                // 换个 token 也是撞同一堵墙，整批停下。不停才记 attemptAt，并照上面的理由先落盘再拉
+                var stop = false
+                stateQ.sync {
+                    let m = monoNow()
+                    if m < globalCooldown { stop = true } else { snaps[i].attemptAt = m }
+                }
+                if stop { break }
+                saveState()
+            }
             let r = Self.fetchAccount(ACCOUNTS[i])
             let mono = monoNow(), now = Date()
             stateQ.sync {
-                var failure = r.2
+                // 套餐类型来自钥匙串，和这次拉取成败无关。凭据读成功了就照它更新——包括字段不见了时清空，
+                // 否则缓存里一个旧的 pro 会永远压着，接口明明给了 Fable 也画不出来；读都没读成功（超时、
+                // 没这条）才保留旧值（Codex 2026-10-14）
+                if r.credParsed { snaps[i].plan = r.plan }
+                var failure = r.error
                 // “成功”也可能只是半份。上游合法地可以不给某个桶（这个账户本来就没有 Fable），
                 // 但“本来有、这次整块不见了”是结构变了，不是账户变了——比如 scope.model 的
                 // 名字改了、或者 seven_day/weekly_all 一起换了名。这个判断只能在这里做：
                 // 只有这里同时看得见新响应和缓存。要拿 nil 盖掉一个已经有的好数字，一律拒收。
                 if failure == nil {
-                    let losesWeekly = snaps[i].weekly?.pct != nil && r.0?.pct == nil
-                    let losesFable = snaps[i].fable?.pct != nil && r.1?.pct == nil
+                    let losesWeekly = snaps[i].weekly?.pct != nil && r.weekly?.pct == nil
+                    let losesFable = snaps[i].fable?.pct != nil && r.fable?.pct == nil
                     if losesWeekly || losesFable { failure = "err_parse" }
                 }
                 // 保护缓存是为了扛住抖动和改名，不是为了把账户焊死。连着 PARSE_GIVE_UP 次
@@ -375,7 +468,7 @@ final class UsageStore {
                 // 永远不是"新常态"，它就是坏的。少了这个条件，这条"认命"通道就等于给
                 // 缓存清空开了张延迟 2 小时的支票——正是这整套东西要防的那件事。
                 if failure == "err_parse" && snaps[i].parseFails >= PARSE_GIVE_UP
-                    && (r.0?.pct != nil || r.1?.pct != nil) { failure = nil }
+                    && (r.weekly?.pct != nil || r.fable?.pct != nil) { failure = nil }
                 if let err = failure {
                     snaps[i].error = err
                     // 只数"连着"的解析失败：中间夹了个 429 或者网络错误，就不该继续
@@ -388,7 +481,7 @@ final class UsageStore {
                         // 账户的退避抹成 0——比这个头压根不存在还糟。非有限或非正一律当没给。
                         // 再给个 60 秒地板：Retry-After: 1e-320 是个合法的有限正数，
                         // 照单全收会让退避比这个头压根不存在时还弱（默认 300s）
-                        let ra: Double? = (r.3?.isFinite == true && r.3! > 0) ? max(r.3!, 60) : nil
+                        let ra: Double? = (r.retryAfter?.isFinite == true && r.retryAfter! > 0) ? max(r.retryAfter!, 60) : nil
                         if force {
                             // 手动重试失败不加倍退避——用户连点不应把退避推到一小时
                             snaps[i].backoff = min(max(snaps[i].backoff, ra ?? 300), BACKOFF_MAX)
@@ -411,8 +504,11 @@ final class UsageStore {
                     snaps[i].rateLimited = false
                     snaps[i].parseFails = 0
                     snaps[i].notBefore = MONO_PAST
-                    snaps[i].weekly = r.0
-                    snaps[i].fable = r.1
+                    snaps[i].weekly = r.weekly
+                    snaps[i].fable = r.fable
+                    // 5 小时桶不参与上面的「丢了就拒收」：它几小时就翻一轮，旧数字本来就没多少参考价值，
+                    // 为它冻住整个账户（连同周限额）不划算。这次没给就显示「—」。
+                    snaps[i].fiveHour = r.fiveHour
                     snaps[i].dataAt = now
                 }
             }
@@ -437,6 +533,7 @@ final class UsageStore {
                     // 已经过去多久，夹在 [0, ACCT_MIN_GAP] 后换算成墙钟绝对时刻
                     "attempt_at": wall - min(max(0, mono - s.attemptAt), ACCT_MIN_GAP),
                     "parse_fails": s.parseFails,
+                    "plan": j(s.plan),
                 ]
                 // 没有生效中的退避窗口就干脆不写这个键。写成“当前时刻”看着无害，但存盘到
                 // 重启之间时钟要是被往回调，它就成了一个未来时刻，白白把健康账户关进闸门。
@@ -446,6 +543,7 @@ final class UsageStore {
                     e["at"] = at.timeIntervalSince1970
                     e["weekly"] = j(s.weekly?.dict)
                     e["fable"] = j(s.fable?.dict)
+                    e["five_hour"] = j(s.fiveHour?.dict)
                 }
                 obj[s.cfg.id] = e
             }
@@ -462,9 +560,11 @@ final class UsageStore {
         try? d.write(to: STATE_FILE, options: .atomic)
     }
 
-    // 解析：以 limits 数组为准（weekly_all=周限额，weekly_scoped=Fable 桶），缺失时退回 seven_day
-    static func parseUsage(_ obj: [String: Any]) -> (Block?, Block?) {
+    // 解析：以 limits 数组为准（weekly_all=周限额，weekly_scoped=Fable 桶，session=5 小时窗口），
+    // 缺失时退回顶层的 seven_day / five_hour（2026-10-14 实测两处给的是同一个数）
+    static func parseUsage(_ obj: [String: Any]) -> (Block?, Block?, Block?) {
         var weekly = Block.upstream(obj["seven_day"])
+        var fiveHour = Block.upstream(obj["five_hour"])
         var fable: Block?
         if let limits = obj["limits"] as? [[String: Any]] {
             var scoped: [[String: Any]] = []
@@ -475,6 +575,8 @@ final class UsageStore {
                 case "weekly_all":
                     if let b = Block.limit(l), b.pct != nil || weekly?.pct == nil { weekly = b }
                 case "weekly_scoped": scoped.append(l)
+                case "session":
+                    if let b = Block.limit(l), b.pct != nil || fiveHour?.pct == nil { fiveHour = b }
                 default: break
                 }
             }
@@ -485,12 +587,12 @@ final class UsageStore {
             let pick = scoped.first { modelName($0).localizedCaseInsensitiveContains("fable") }
             fable = pick.flatMap(Block.limit)
         }
-        return (weekly, fable)
+        return (weekly, fable, fiveHour)
     }
 
-    static func fetchAccount(_ cfg: AcctCfg) -> (Block?, Block?, String?, Double?) {
-        let (token, kcErr) = readToken(cfg.keychain)
-        guard let token = token else { return (nil, nil, kcErr ?? "no_token", nil) }
+    static func fetchAccount(_ cfg: AcctCfg) -> FetchResult {
+        let (token, kcErr, plan, credParsed) = readToken(cfg.keychain)
+        guard let token = token else { return FetchResult(error: kcErr ?? "no_token", plan: plan, credParsed: credParsed) }
         var req = URLRequest(url: USAGE_URL)
         req.timeoutInterval = 12
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -498,25 +600,25 @@ final class UsageStore {
         req.setValue(BETA_HEADER, forHTTPHeaderField: "anthropic-beta")
         req.setValue("claude-reset-widget/2.0", forHTTPHeaderField: "User-Agent")
         let sem = DispatchSemaphore(value: 0)
-        let out = Locked<(Block?, Block?, String?, Double?)>((nil, nil, "err_timeout", nil))
+        let out = Locked<FetchResult>(FetchResult(error: "err_timeout", plan: plan, credParsed: credParsed))
         let task = URLSession.shared.dataTask(with: req) { data, resp, err in
             defer { sem.signal() }
-            if err != nil { out.set((nil, nil, "err_network", nil)); return }
-            guard let http = resp as? HTTPURLResponse else { out.set((nil, nil, "err_network", nil)); return }
-            if http.statusCode == 401 { out.set((nil, nil, "token_expired", nil)); return }
+            if err != nil { out.set(FetchResult(error: "err_network", plan: plan, credParsed: credParsed)); return }
+            guard let http = resp as? HTTPURLResponse else { out.set(FetchResult(error: "err_network", plan: plan, credParsed: credParsed)); return }
+            if http.statusCode == 401 { out.set(FetchResult(error: "token_expired", plan: plan, credParsed: credParsed)); return }
             if http.statusCode == 429 {
                 let ra = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-                out.set((nil, nil, "http_429", ra)); return
+                out.set(FetchResult(error: "http_429", retryAfter: ra, plan: plan, credParsed: credParsed)); return
             }
             guard http.statusCode == 200 else {
-                out.set((nil, nil, "http_\(http.statusCode)", nil)); return
+                out.set(FetchResult(error: "http_\(http.statusCode)", plan: plan, credParsed: credParsed)); return
             }
             // 200 但正文不是预期 JSON，和状态码错误不是一回事，单独报
             guard let d = data,
                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
-                out.set((nil, nil, "err_body", nil)); return
+                out.set(FetchResult(error: "err_body", plan: plan, credParsed: credParsed)); return
             }
-            let (w, f) = parseUsage(obj)
+            let (w, f, h) = parseUsage(obj)
             // 判空必须落在界面真正要显示的那个值——百分比——上，只看 Block 在不在是不够的：
             // 桶还在、resets_at 也还在、唯独 percent 改了名或换成字符串时，Block 是非 nil 的，
             // 于是一个 pct=nil 的“成功”顺着成功分支覆盖并落盘，用户最后一份准数字永久没了。
@@ -532,8 +634,8 @@ final class UsageStore {
             // 放在 doRefresh 里做——搁这儿做会变成一条无状态的拒收，
             // 无论收敛与否都会一直触发，把账户锁死在 5 拒 1 收的死循环里。
             // 解析结果照常回传，让 doRefresh 拿得到新形状。
-            if w?.pct == nil && f?.pct == nil { out.set((w, f, "err_parse", nil)); return }
-            out.set((w, f, nil, nil))
+            if w?.pct == nil && f?.pct == nil { out.set(FetchResult(weekly: w, fable: f, error: "err_parse", fiveHour: h, plan: plan, credParsed: credParsed)); return }
+            out.set(FetchResult(weekly: w, fable: f, fiveHour: h, plan: plan, credParsed: credParsed))
         }
         task.resume()
         // timeoutInterval 是空闲超时；这里兜一个总时长上限，超了就取消任务（不留孤儿请求）。
@@ -541,14 +643,14 @@ final class UsageStore {
         // 同一次超时报出来的错误码会飘。
         if sem.wait(timeout: .now() + NET_WAIT) == .timedOut {
             task.cancel()
-            return (nil, nil, "err_timeout", nil)
+            return FetchResult(error: "err_timeout", plan: plan, credParsed: credParsed)
         }
         return out.get()
     }
 
-    // 返回 (token, 错误码)。失败原因必须分开报：超时 / 拒绝授权 / 没这一项 / JSON 变了
+    // 返回 (token, 错误码, 套餐类型, 凭据 JSON 是否读成功)。失败原因必须分开报：超时 / 拒绝授权 / 没这一项 / JSON 变了
     // 全部塞进 "no_token"，用户就会拿着 `security dump-keychain` 去找一条明明存在的凭据。
-    static func readToken(_ service: String) -> (String?, String?) {
+    static func readToken(_ service: String) -> (String?, String?, String?, Bool) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         p.arguments = ["find-generic-password", "-s", service, "-w"]
@@ -557,24 +659,26 @@ final class UsageStore {
         p.standardError = FileHandle.nullDevice
         let sem = DispatchSemaphore(value: 0)
         p.terminationHandler = { _ in sem.signal() }
-        do { try p.run() } catch { return (nil, "kc_spawn") }
+        do { try p.run() } catch { return (nil, "kc_spawn", nil, false) }
         // 45s：给钥匙串授权弹窗留出人手点击的时间（5s 会把弹窗杀掉，用户永远来不及授权）
         if sem.wait(timeout: .now() + KEYCHAIN_WAIT) == .timedOut {
             p.terminate()
             try? pipe.fileHandleForReading.close()   // 不然每超时一次漏一个读端 fd
-            return (nil, "kc_timeout")
+            return (nil, "kc_timeout", nil, false)
         }
         let d = pipe.fileHandleForReading.readDataToEndOfFile()
         guard p.terminationStatus == 0 else {
             // 44 = errSecItemNotFound，真的没有这条；其余是权限/钥匙串本身的问题
-            return (nil, p.terminationStatus == 44 ? "no_token" : "kc_exit_\(p.terminationStatus)")
+            return (nil, p.terminationStatus == 44 ? "no_token" : "kc_exit_\(p.terminationStatus)", nil, false)
         }
         guard let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
-            return (nil, "kc_bad_json")
+            return (nil, "kc_bad_json", nil, false)
         }
         let oauth = obj["claudeAiOauth"] as? [String: Any] ?? obj
-        guard let t = oauth["accessToken"] as? String, !t.isEmpty else { return (nil, "kc_no_field") }
-        return (t, nil)
+        // 套餐类型（"max" / "pro" …）和 token 在同一份凭据里，顺手带出来，不多发一个请求
+        let plan = oauth["subscriptionType"] as? String
+        guard let t = oauth["accessToken"] as? String, !t.isEmpty else { return (nil, "kc_no_field", plan, true) }
+        return (t, nil, plan, true)
     }
 }
 
@@ -630,7 +734,26 @@ func effectiveRem(_ b: Block?) -> Double? {
 // 重置时间优先看 Fable 桶，该桶没给时间才退回周限额。回退必须在 epoch 这一层做：
 // 写成 `(fable ?? weekly)?.resetsEpoch` 时，一个有 pct 却缺 resets_at 的 Fable 桶
 // 会连带把周限额那个好端端的重置时间一起吞掉，界面上就成了 "?" / "—"。
-func resetEpoch(_ s: AcctSnap) -> Double? { s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch }
+// 套餐含不含 Fable 周额度。以钥匙串凭据里的套餐类型为准：Max 含（每周最多一半额度可用在 Fable 上）；
+// Pro 不含（Fable 走按量付费，不进套餐额度，接口也就不给 Fable 桶）——见官方帮助页
+// "Claude Fable models on your plan"。读不到套餐类型或是别的类型（Team / Enterprise 按席位而定）时
+// 退回看数据：拉到了周数据却没有 Fable 桶 = 不含；一点数据都没有时当作含（那是「还不知道」）。
+func includesFable(_ s: AcctSnap) -> Bool {
+    switch s.plan {
+    case "pro"?: return false
+    case "max"?: return true
+    default: return s.fable != nil || s.weekly == nil
+    }
+}
+
+// 套餐不含 Fable 时只看周：缓存里可能还留着降级前的 Fable 桶（缺桶保护会先保住它），它的重置时间
+// 不能出现在只画周环的账户旁边（Codex 2026-10-14）
+func resetEpoch(_ s: AcctSnap) -> Double? {
+    includesFable(s) ? (s.fable?.resetsEpoch ?? s.weekly?.resetsEpoch) : s.weekly?.resetsEpoch
+}
+
+// 界面上算「有数据」：同理，不含 Fable 的账户不拿一个隐藏的 Fable 桶充数
+func hasShownData(_ s: AcctSnap) -> Bool { s.weekly != nil || (includesFable(s) && s.fable != nil) }
 
 // 菜单行的重置说明；哨兵情况（已过/未知）单独成句，不与"后重置"拼接出乱语。
 // now 只取一次再传下去，判空也用和 shortLeft 一模一样的谓词：分两次取 Date() 时，
@@ -655,7 +778,9 @@ func seg(_ s: String, _ color: NSColor, _ size: CGFloat, bold: Bool = false, mon
 // 额度本来就是拿来花完的，剩得少是常态不是事故，环只当油量表不当告警器；
 // 身份由内外位置编码，也不配身份色。菜单里的数字警色(remColor)另说——那里看的是细节。
 // rem=剩余%(0-100)，从 12 点顺时针消耗，nil(无数据)只画淡轨道
-func ringImage(outerRem: Double?, innerRem: Double?, size: CGFloat = 15) -> NSImage {
+// showInner=false 只画外环：给套餐里根本没有 Fable 的账户用（Pro：Fable 走按量付费、不进额度，
+// 接口压根不给 weekly_scoped 桶）。和「有 Fable 但这次没数据」区分开——后者照画内环的淡轨道。
+func ringImage(outerRem: Double?, innerRem: Double?, showInner: Bool = true, size: CGFloat = 15) -> NSImage {
     NSImage(size: NSSize(width: size, height: size), flipped: false) { _ in
         let c = NSPoint(x: size / 2, y: size / 2)
         let lw: CGFloat = 2
@@ -676,7 +801,7 @@ func ringImage(outerRem: Double?, innerRem: Double?, size: CGFloat = 15) -> NSIm
         }
         let outerR = (size - lw) / 2
         ring(outerR, outerRem)            // 外环：周限额
-        ring(outerR - lw - 1, innerRem)   // 内环：Fable（留 1pt 缝隙防糊成一团）
+        if showInner { ring(outerR - lw - 1, innerRem) }   // 内环：Fable（留 1pt 缝隙防糊成一团）
         return true
     }
 }
@@ -749,14 +874,33 @@ final class AccountRowView: NSView {
         needsDisplay = true
     }
 
+    // 账户名最宽 26pt：名字从 x=27 起、数据列从 66 起，中间还要给 ⚠ 留位。~/.claude-personal 这种
+    // 长后缀截成「P…」，全名和目录在 tooltip 第一行（Codex 2026-10-14）
+    private func fitLabel(_ full: String, _ color: NSColor) -> NSAttributedString {
+        var a = seg(full, color, 13, bold: true)
+        var n = full.count
+        while a.size().width > 26 && n > 1 {
+            n -= 1
+            a = seg(String(full.prefix(n)) + "…", color, 13, bold: true)
+        }
+        return a
+    }
+
     private func refreshTip() {
-        var tip = ""
+        var tip = "账户 \(snap.cfg.label)（\(snap.cfg.dir)）"
         if let ep = resetEpoch(snap) { tip += "重置时间 \(resetAt(ep))" }
+        if let p = snap.plan {
+            let name = ["max": "Max", "pro": "Pro"][p] ?? p
+            tip += (tip.isEmpty ? "" : "\n") + "套餐 \(name)" + (includesFable(snap) ? "" : "（Fable 不含在额度里）")
+        }
+        if let ep = snap.fiveHour?.resetsEpoch {
+            tip += (tip.isEmpty ? "" : "\n") + "5 小时窗口 \(resetAt(ep)) 重置"
+        }
         if let at = snap.dataAt {
             tip += (tip.isEmpty ? "" : "\n") + "数据更新于 \(ageText(max(0, -at.timeIntervalSinceNow)))"
         }
         if let e = snap.error {
-            let has = snap.weekly != nil || snap.fable != nil
+            let has = hasShownData(snap)
             tip += (tip.isEmpty ? "" : "\n") + "上次拉取失败：\(errText(e, hasData: has))"
         }
         toolTip = tip.isEmpty ? nil : tip
@@ -778,9 +922,9 @@ final class AccountRowView: NSView {
         let on = snap.active
         (on ? dotColor : dotColor.withAlphaComponent(0.35)).setFill()
         NSBezierPath(ovalIn: NSRect(x: 14, y: 9.5, width: 7, height: 7)).fill()
-        let lx = put(seg(snap.cfg.label, on ? .labelColor : .secondaryLabelColor, 13, bold: true), 27, 4.5)
+        let lx = put(fitLabel(snap.cfg.label, on ? .labelColor : .secondaryLabelColor), 27, 4.5)
 
-        let hasData = snap.weekly != nil || snap.fable != nil
+        let hasData = hasShownData(snap)
         // 账户级状态标记跟着账户字母走，不混进数据列
         if snap.error != nil && hasData { put(seg("⚠", .systemOrange, 9), lx + 3, 7.5) }
         guard hasData else {
@@ -788,18 +932,24 @@ final class AccountRowView: NSView {
             return
         }
 
-        // 两列数字：标签固定 x，数字右对齐固定右缘（跨行对齐）；颜色即严重度
+        // 三列数字：标签固定 x，数字右对齐固定右缘（跨行对齐）；颜色即严重度
         func gauge(_ name: String, _ b: Block?, _ labelX: CGFloat, _ numRight: CGFloat) {
             put(seg(name, .secondaryLabelColor, 11), labelX, 7)
             guard let rem = effectiveRem(b) else { putRight(seg("—", .secondaryLabelColor, 12), numRight, 6); return }
             putRight(seg("剩\(Int(rem))%", remColor(rem), 13, bold: true, mono: true), numRight, 4.5)
         }
-        gauge("Fable", snap.fable, 66, 156)
-        gauge("周", snap.weekly, 176, 248)
+        gauge("5小时", snap.fiveHour, 66, 156)
+        if includesFable(snap) {
+            gauge("Fable", snap.fable, 176, 266)
+        } else {   // 套餐不含 Fable：写明「不含」，别用「—」让人以为是没拉到
+            put(seg("Fable", .secondaryLabelColor, 11), 176, 7)
+            putRight(seg("不含", .secondaryLabelColor, 12), 266, 6)
+        }
+        gauge("周", snap.weekly, 286, 358)
 
-        // 右缘：距重置倒计时。常见最长 "20时47分后重置" 实测 94px（起点 311）；
-        // 能构造出来的最长是重置时刻贴着 EPOCH_MAX 的 "364583天8时后重置"，117px、起点 289。
-        // 两种都离周列的右缘(248)有 ≥41px，撞不上。
+        // 右缘：距重置倒计时（Fable / 周的，不是 5 小时的）。常见最长 "20时47分后重置" 实测 94px
+        // （起点 422）；能构造出来的最长是重置时刻贴着 EPOCH_MAX 的 "364583天8时后重置"，117px、
+        // 起点 399。两种都离周列的右缘(358)有 ≥41px，撞不上（加 5 小时列时整体右移 110、行宽同步 +110）。
         putRight(seg(resetPhrase(resetEpoch(snap)), .labelColor, 12, mono: true), R, 5.5)
     }
 }
@@ -836,8 +986,12 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         store.onUpdate = { [weak self] in self?.render() }
         store.tick()
         render()
-        // 启动预热：45 秒后错峰拉另一个账户（tick 自动挑数据最旧的），不和首次拉取挤在同一瞬间
-        every(45, repeats: false, 5) { [weak self] in self?.store.tick() }
+        // 启动预热：首次拉取之后再错峰拉两个账户（45 秒、105 秒，tick 自动挑最久没拉的），不和首次拉取
+        // 挤在同一瞬间。封顶两个：usage 接口持续每分钟一次就会 429，账户一多按账户数展开就是一长串
+        // 一分钟一个的请求（Codex 2026-10-14）。其余账户跟着每 30 分钟的轮转，打开菜单时数据旧了也会补拉。
+        for k in 1..<min(max(ACCOUNTS.count, 1), 3) {
+            every(45 + 60 * Double(k - 1), repeats: false, 5) { [weak self] in self?.store.tick() }
+        }
         every(POLL_SEC, 10) { [weak self] in self?.store.tick() }
         // 界面时钟和网络节奏彻底分开：倒计时、"✓"、环的满格都是随时间自己在变的，
         // 挂在 30 分钟的拉取定时器上，就会出现额度早已恢复而菜单栏还挂着 "15m" 的半小时空窗。
@@ -874,7 +1028,7 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 菜单栏标题: 每账户 = 余量同心双环(外=周限额, 内=Fable) + 距重置时间(文字主角)，如 "◔ 5d  ◑ 21h"
-    // 左 A 右 B 靠位置区分
+    // 从左到右按 ACCOUNTS 的顺序（A、B、C…），靠位置区分
     func render() {
         let u = store.uiState()
         let snaps = u.snaps
@@ -884,12 +1038,13 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let remW = effectiveRem(s.weekly)
             let remF = effectiveRem(s.fable)
             let att = NSTextAttachment()
-            att.image = ringImage(outerRem: remW, innerRem: remF)
+            // 套餐不含 Fable（Pro）只画外环，判断见 includesFable
+            att.image = ringImage(outerRem: remW, innerRem: remF, showInner: includesFable(s))
             att.bounds = CGRect(x: 0, y: -3, width: 15, height: 15)
             title.append(NSAttributedString(attachment: att))
             // 倒计时仍以 Fable 桶为准（该桶没给时间才退回周），文字和取值同源
             // 标题不放警标：闲置账户 token 过期是常态（数据照样够准），错误详情在菜单行/tooltip
-            if (remF ?? remW) != nil {
+            if (includesFable(s) ? (remF ?? remW) : remW) != nil {
                 title.append(seg(" \(tinyLeft(resetEpoch(s)))", .labelColor, 13, mono: true))
             } else {
                 title.append(seg(" —", .labelColor, 13))
@@ -911,6 +1066,13 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshItem?.isEnabled = !u.refreshing && blocked == nil
     }
 
+    // 每个账户多久被后台轮到一次：每 tick 只拉一个账户、各账户轮流，所以是 账户数 × POLL_SEC
+    func pollEveryText() -> String {
+        let m = Int(POLL_SEC) * max(ACCOUNTS.count, 1) / 60
+        if m % 60 == 0 { return m == 60 ? "每小时" : "每 \(m / 60) 小时" }
+        return "每 \(m) 分钟"
+    }
+
     // 页脚这句话盖在所有账户行上面，写的必须是对最旧那一行也成立的话
     func footerText(_ u: UIState) -> String {
         // “每账户”不能省：强刷是串行走完所有账户的，这条横幅可以挂到两倍时长
@@ -929,7 +1091,7 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 菜单项自相矛盾
         // 两种说法同宽，换措辞不会改变页脚的最大宽度
         let tail = u.gated.map { (u.allGated ? "轮询退避中，约 " : "部分退避中，约 ") + "\(mins($0)) 分钟后恢复" }
-            ?? "后台每小时轮询一次/账户"
+            ?? "后台\(pollEveryText())轮询一次/账户"
         let full = head + " · " + tail
         // 量出来再决定：页脚一旦比行宽，就会在菜单正开着的时候把整个菜单撑开重排。
         // 与其赌措辞永远够短，不如超了就丢掉前半句——“为什么不动”比“数据多旧”更该留。

@@ -6,7 +6,8 @@
 **[中文文档](README.zh-CN.md)**
 
 A macOS menu bar widget that answers one question at a glance: *how much Claude quota is
-left, and when does it reset* — for two accounts at once.
+left, and when does it reset* — for every Claude Code account on the machine, discovered
+automatically.
 
 No backend, no dependencies, no package manager. One Swift file compiled into a single
 binary that runs as a LaunchAgent.
@@ -22,27 +23,34 @@ concentric ring plus a reset countdown per account — something like `◔ 5d  �
 rings are drawn, those two characters are just an illustration):
 
 - **Outer ring = weekly all-model limit remaining. Inner ring = Fable weekly capacity
-  remaining.** Fill ratio *is* the remaining percentage.
+  remaining.** Fill ratio *is* the remaining percentage. An account whose plan doesn't
+  include Fable (Pro) gets the outer ring only.
 - The rings are monochrome throughout — they follow `labelColor`, so they stay legible on
   light and dark menu bars and on wallpaper-tinted ones. There is deliberately no
   orange/red warning state: quota is meant to be spent, so "not much left" is the normal
   case, not an incident. The ring is a fuel gauge, not an alarm.
-- Account A is always on the left, B on the right.
+- Accounts go left to right: A, B, C, ….
 - Once a reset time passes, the account switches to "restored": ring full, countdown
   replaced by ✓.
 
-Click for one row per account. Hover a row for the absolute reset time, data age, and
-error detail. A failing account gets a small ⚠ next to its letter and **keeps showing its
+Click for one row per account. Hover a row for the account's directory, the absolute reset
+time, the 5-hour window's reset time, the plan, data age, and error detail. A failing account gets a small ⚠ next to its letter and **keeps showing its
 last good numbers**:
 
 ```
-● A⚠   Fable 剩97%   周 剩97%       6天后重置
-● B    Fable 剩45%   周 剩64%    20时47分后重置
-        │              │                │
-        │              │                └─ time until reset
-        │              └─ weekly all-model limit remaining
-        └─ Fable weekly capacity remaining
+● A⚠   5小时 剩59%   Fable 剩97%   周 剩97%       6天后重置
+● B    5小时 剩93%   Fable 剩45%   周 剩64%    20时47分后重置
+● C    5小时 剩54%   Fable  不含   周 剩93%      2天4时后重置
+        │              │              │                │
+        │              │              │                └─ time until reset
+        │              │              └─ weekly all-model limit remaining
+        │              └─ Fable weekly capacity remaining (不含 = not in this plan)
+        └─ 5-hour window remaining
 ```
+
+The 5-hour window is shown only here, not in the menu bar: it turns over every few hours
+while polling is lazy (below), so the number can be over an hour old — hover for its age,
+or use Claude Code's own status line for a live figure.
 
 The account currently in use gets a solid dot and full-brightness text; the idle one gets
 a translucent dot and grey text. "Quit" really quits — the LaunchAgent only relaunches on
@@ -56,21 +64,23 @@ a crash, and starts the app at login.
 ## How it works
 
 - Reads the Claude Code OAuth token for each account from the macOS Keychain,
-  **read-only**. It never refreshes or writes a token, so it can't knock the Claude Code
+  **read-only**, along with the plan type stored next to it (`subscriptionType`). It never refreshes or writes a token, so it can't knock the Claude Code
   CLI out of its session. Nothing is sent anywhere except `api.anthropic.com`.
 - Background polling is deliberately lazy: one call to `api.anthropic.com/api/oauth/usage`
-  every 30 minutes, fetching **one account per tick**, alternating — so **one request per
-  account per hour**. This endpoint is rate-limited hard: a sustained 1 request/minute
+  every 30 minutes, fetching **one account per tick**, in rotation — so with N accounts,
+  **one request per account every N×30 minutes** (90 minutes for three). This endpoint is rate-limited hard: a sustained 1 request/minute
   still earns a 429.
 - The weekly limit comes from the `limits[]` entry with `kind=weekly_all`; the Fable
   bucket from `kind=weekly_scoped` whose `scope.model.display_name` matches "Fable". If no
   bucket matches by name it is left empty rather than borrowing some other model's bucket.
+  The 5-hour window comes from `kind=session` (falling back to the top-level `five_hour`).
 - Scheduling rotates on *last attempt time* regardless of success, so one persistently
   failing account (an idle account with an expired token, say) can never starve the other
   account's refresh.
 - Three gates decide when a request actually goes out: a **5 minute** minimum interval per
   account; opening the menu only triggers a fetch if the selected account's data is more
-  than **25 minutes** old; manual refresh is throttled to once per **5 minutes**.
+  than **25 minutes** old; manual refresh is throttled to once per **5 minutes** (it hits every account, so with more
+  than three accounts the gap grows by 100 seconds per account, and a 429 stops the batch).
 - Failures back off per account: 5 → 10 → 20 … minutes, capped at 1 hour. A 429 takes the
   larger of that and the server's `Retry-After`, and adds a 60 second global cooldown. One
   account being rate-limited does not gate the other.
@@ -121,33 +131,35 @@ history; only the conclusions are listed here.
 
 ## Configuration
 
-Accounts are compiled in, at the top of `menubar/ClaudeReset.swift`:
+**None.** At launch the widget discovers accounts on its own: it scans the Claude Code
+config directories `~/.claude` and `~/.claude-*` and keeps the ones that actually have
+login credentials in the Keychain. `~/.claude` becomes A, `~/.claude-b` becomes B,
+`~/.claude-work` becomes WORK, and so on.
 
-```swift
-let ACCOUNTS = [
-    AcctCfg(id: "a", label: "A", keychain: "Claude Code-credentials"),
-    AcctCfg(id: "b", label: "B", keychain: "Claude Code-credentials-CHANGEME"),
-]
-```
+How: Claude Code stores one OAuth credential per config directory in the Keychain — the
+default directory under `Claude Code-credentials`, any other directory (the one
+`CLAUDE_CONFIG_DIR` points at) under `Claude Code-credentials-` plus the first 8 hex
+characters of the SHA-256 of the directory's absolute path. So a `~/.claude-xxx` that
+isn't a config directory is never picked up, and a leftover Keychain entry whose directory
+is gone doesn't show up either.
 
-`keychain` is the Keychain **service name** where Claude Code stores that account's OAuth
-credentials. The first account uses the default `Claude Code-credentials`; every
-additional account you log into gets its own entry with a hash suffix that differs per
-user and per machine. Find yours with:
-
-```bash
-security dump-keychain | grep 'Claude Code-credentials'
-```
-
-Getting it wrong is not fatal — that row shows "no such credential in the Keychain" and
-the other account keeps working. Then re-run `./install.sh` to rebuild and reload.
-
-- **One account:** delete the second line.
-- **Three or more:** it works (dot colours cycle), but two things need attention — the
-  menu bar title grows one ring group per account, and the footer string "polls once per
-  hour per account" is hard-coded for 2 accounts × `POLL_SEC` (30 min). Change both.
+- **Logged into a new account:** restart the widget (it scans once, at launch):
+  `launchctl kickstart -k gui/$(id -u)/io.github.davie521.claude-reset-menubar`, or re-run
+  `./install.sh`.
+- **Not found:** `CLAUDE_CONFIG_DIR` points outside `~/.claude-*`, or is spelled
+  differently from the real path (a trailing `/` changes the hash).
+- **Many accounts:** the menu bar title grows one ring group (~50pt) per account; on a
+  notched display macOS hides the whole item when it no longer fits. The footer's polling
+  interval follows the account count; at launch it fetches one account and warms up at most
+  two more (the endpoint is rate-limited too hard to fan out per account), the rest follow
+  the 30-minute rotation. Long names (`~/.claude-personal`) are truncated in the dropdown;
+  hover for the full name and directory.
+- **Plan:** read from `subscriptionType` in the Keychain credential. `pro` gets no Fable
+  ring (on Pro, Fable runs on pay-as-you-go usage credits rather than plan limits, and the
+  API returns no Fable bucket); `max` does. Without a plan type, it falls back to whether
+  the API returned a Fable bucket.
 - **Which account is "in use"** is read from `~/.claude-current-acct`, a file containing
-  just `a` or `b`. It only drives the solid-vs-translucent dot; if the file is absent,
+  just `a`, `b`, …. It only drives the solid-vs-translucent dot; if the file is absent,
   account `a` is assumed. Write it from whatever you use to switch accounts.
 - The tracked scoped model is matched by display name containing "Fable"
   (`UsageStore.parseUsage`). Change that string to track a different model's weekly
@@ -230,7 +242,8 @@ docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable install.sh
   cache, show ⚠), and to adapt after 5 consecutive rejections — but a removed endpoint is
   a removed endpoint.
 - **It is rate-limited aggressively.** If you fork this and make it poll faster, you will
-  get 429s. The default cadence — one request per account per hour — is the point.
+  get 429s. The default cadence — one request every 30 minutes in total, rotating across
+  accounts — is the point.
 - Reading the Keychain may raise an authorisation prompt the first time (the app waits up
   to 45 seconds for you to click it). Grant "Always Allow" to avoid repeats.
 - macOS only, Apple silicon and Intel alike; no signing or notarisation, since you compile
