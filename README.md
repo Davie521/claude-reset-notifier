@@ -133,7 +133,7 @@ history; only the conclusions are listed here.
 
 **None.** At launch the widget discovers accounts on its own: it scans the Claude Code
 config directories `~/.claude` and `~/.claude-*` and keeps the ones that actually have
-login credentials in the Keychain. `~/.claude` becomes A, `~/.claude-b` becomes B,
+login credentials in the Keychain (if none are found, a single A row says so). `~/.claude` becomes A, `~/.claude-b` becomes B,
 `~/.claude-work` becomes WORK, and so on.
 
 How: Claude Code stores one OAuth credential per config directory in the Keychain — the

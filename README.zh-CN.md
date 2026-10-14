@@ -56,7 +56,7 @@ macOS 菜单栏小组件：监控本机所有 Claude Code 账户（自动发现�
 
 ## 配置
 
-**不用配置。**看板启动时自动找账户：扫 `~/.claude` 和 `~/.claude-*` 这些 Claude Code 配置目录，只留钥匙串里真有登录凭据的。`~/.claude` 记作 A，`~/.claude-b` 记作 B，`~/.claude-work` 记作 WORK，以此类推。
+**不用配置。**看板启动时自动找账户：扫 `~/.claude` 和 `~/.claude-*` 这些 Claude Code 配置目录，只留钥匙串里真有登录凭据的（一个都找不到时显示 A 一行，告诉你钥匙串里没有凭据）。`~/.claude` 记作 A，`~/.claude-b` 记作 B，`~/.claude-work` 记作 WORK，以此类推。
 
 原理：Claude Code 每个配置目录在钥匙串里存一条 OAuth 凭据，默认目录是 `Claude Code-credentials`，其他目录（`CLAUDE_CONFIG_DIR` 指过去的）是 `Claude Code-credentials-` 加上目录绝对路径 SHA-256 的前 8 位。所以不是配置目录的 `~/.claude-xxx` 不会被误认，目录删了、钥匙串里还剩的旧条目也不会冒出来。
 
