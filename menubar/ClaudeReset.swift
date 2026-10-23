@@ -456,9 +456,13 @@ final class UsageStore {
                 // 但“本来有、这次整块不见了”是结构变了，不是账户变了——比如 scope.model 的
                 // 名字改了、或者 seven_day/weekly_all 一起换了名。这个判断只能在这里做：
                 // 只有这里同时看得见新响应和缓存。要拿 nil 盖掉一个已经有的好数字，一律拒收。
+                // 例外：套餐明说不含 Fable（上面刚按凭据更新过 plan）。这时接口本来就不给 Fable 桶，
+                // 缓存里那份是同一目录上一个号、或降级前的套餐留下的，丢掉才对。照样拒收的话，
+                // 周限额会跟着冻在旧数字上，旧重置时间一过还会被画成满环 ✓——实际可能已经快用完了
+                // （2026-10-23 实测：~/.claude-b 从 Max 号换登 Pro 号，菜单栏满环，实际周用量 94%）
                 if failure == nil {
                     let losesWeekly = snaps[i].weekly?.pct != nil && r.weekly?.pct == nil
-                    let losesFable = snaps[i].fable?.pct != nil && r.fable?.pct == nil
+                    let losesFable = includesFable(snaps[i]) && snaps[i].fable?.pct != nil && r.fable?.pct == nil
                     if losesWeekly || losesFable { failure = "err_parse" }
                 }
                 // 保护缓存是为了扛住抖动和改名，不是为了把账户焊死。连着 PARSE_GIVE_UP 次
@@ -888,7 +892,7 @@ final class AccountRowView: NSView {
 
     private func refreshTip() {
         var tip = "账户 \(snap.cfg.label)（\(snap.cfg.dir)）"
-        if let ep = resetEpoch(snap) { tip += "重置时间 \(resetAt(ep))" }
+        if let ep = resetEpoch(snap) { tip += (tip.isEmpty ? "" : "\n") + "重置时间 \(resetAt(ep))" }
         if let p = snap.plan {
             let name = ["max": "Max", "pro": "Pro"][p] ?? p
             tip += (tip.isEmpty ? "" : "\n") + "套餐 \(name)" + (includesFable(snap) ? "" : "（Fable 不含在额度里）")

@@ -106,7 +106,10 @@ history; only the conclusions are listed here.
   bucket carrying only `resets_at` would otherwise sail down the success path and paint
   over good numbers. A renamed field, a value that turned into a string, a JSON boolean,
   or a previously populated bucket vanishing entirely all count as failure. (A machine
-  that legitimately has no Fable bucket is fine — that's not a loss.)
+  that legitimately has no Fable bucket is fine — that's not a loss. Nor is a Fable bucket
+  vanishing on an account whose plan is Pro: the directory was switched to a Pro login or
+  the plan was downgraded, so the cached Fable number is stale, and rejecting the response
+  would freeze the weekly limit along with it.)
 - **But protecting the cache must not weld the account shut.** After the same shape is
   rejected `PARSE_GIVE_UP` (5) times in a row — roughly 2 hours once the backoff ladder is
   factored in — the new structure is accepted, **provided it still carries at least one
