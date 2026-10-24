@@ -12,6 +12,8 @@
 //     非 429 的失败（token 过期 / 网络 / 5xx）也退避，否则坏账户每轮都吃掉唯一的拉取名额
 //   - “立即刷新”尊重服务器给的 429 窗口和全局冷却，只越过我们自己加的软退避；
 //     被闸门挡住时菜单项直接置灰并写明还要多久，不让用户点了没反应
+//   - token 过期的账户每分钟看一眼钥匙串条目的修改时间（只查属性、不发请求），Claude Code 一换新 token
+//     就立刻重拉，不等软退避走完
 //   - 拉取失败继续显示上次成功的数据(⚠ 降级标记)而不是清空。一份连一个百分比都没有的
 //     200 永远按失败处理，绝不写进缓存；某个桶的百分比没了也先拒收（套餐是 Pro 时 Fable 桶除外），
 //     连着 PARSE_GIVE_UP 次才认下新形状（且新形状必须还带着至少一个百分比）——保护缓存，但不把账户焊死
@@ -57,6 +59,41 @@ func keychainHas(_ service: String) -> Bool? {
     case 44: return false
     default: return nil
     }
+}
+
+// 钥匙串条目的修改时间（mdat，秒级），同样只查属性、不取密码。Claude Code 每次刷新 token 都会重写自己那一条，
+// 所以凭据失效的账户靠它判断「换没换新 token」，不用发请求去试。读不到（没这条 / 超时 / 输出格式变了）
+// 一律返回 nil，调用方当「没变」处理：最坏退回原来的退避节奏，不会因此多发请求。
+// 输出里那一行长这样：    "mdat"<timedate>=0x32303236...5A00  "20261024132403Z\000"
+let mdatFmt: DateFormatter = {
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(identifier: "UTC")
+    f.dateFormat = "yyyyMMddHHmmss"
+    return f
+}()
+func keychainMtime(_ service: String) -> Double? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-s", service]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    let sem = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in sem.signal() }
+    do { try p.run() } catch { return nil }
+    if sem.wait(timeout: .now() + 5) == .timedOut {
+        p.terminate()
+        try? pipe.fileHandleForReading.close()
+        return nil
+    }
+    let d = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard p.terminationStatus == 0, let out = String(data: d, encoding: .utf8),
+          let line = out.split(separator: "\n").first(where: { $0.contains("\"mdat\"<timedate>") }),
+          let r = line.range(of: #""\d{14}Z"#, options: .regularExpression),
+          let t = mdatFmt.date(from: String(line[r].dropFirst().prefix(14)))?.timeIntervalSince1970,
+          t.isFinite, abs(t) < EPOCH_MAX else { return nil }
+    return t
 }
 
 // state.json 的键（也是 ~/.claude-current-acct 里写的那个字母）。必须只由这一个目录自己决定：
@@ -113,6 +150,9 @@ let FORCE_GAP: TimeInterval = max(FORCE_MIN_GAP, 100 * Double(max(ACCOUNTS.count
 let TICK_MIN_GAP: TimeInterval = 15     // 自动拉取去重间隔（定时器与菜单打开撞车时）
 let ACCT_MIN_GAP: TimeInterval = 300    // 非强刷时单账户最小尝试间隔（防频繁开菜单放大请求）
 let BACKOFF_MAX: TimeInterval = 3600    // 退避上限
+let CRED_WATCH_SEC: TimeInterval = 60   // 凭据失效的账户：多久看一眼钥匙串条目有没有被 Claude Code 重写。
+                                        // 只查属性不发请求，也只在有账户凭据失效时才起子进程
+let CRED_ERRORS: Set<String> = ["token_expired", "no_token"]   // 跑一次 claude 就能好的那几类失败
 let PARSE_GIVE_UP = 5                   // 连续这么多次都解析不出来就认了，收下新形状。
                                         // 保护缓存不能变成把账户永久卡死：万一上游真的改了
                                         // （Fable 桶改名、或者账户没这个额度了），一直拒收会让
@@ -248,6 +288,8 @@ struct AcctSnap {
     var backoff: TimeInterval = 0
     var rateLimited = false  // 闸门是服务器给的(429) 还是我们自己加的软退避——决定手动刷新能否越过
     var parseFails = 0       // 连续解析失败次数；到 PARSE_GIVE_UP 就收下新形状，别把账户卡死
+    var credFailAt: Double?  // 凭据类失败（CRED_ERRORS）那次读钥匙串之前的墙钟时刻；钥匙串条目在这之后被重写过，
+                             // 就是 Claude Code 换了新 token，立刻重拉。非凭据类失败或成功时为 nil。墙钟是因为要跟 mdat 比
 }
 
 // 界面需要的全部状态，一次锁读齐（见 UsageStore.uiState）
@@ -275,8 +317,10 @@ final class UsageStore {
     static let shared = UsageStore()
     private let stateQ = DispatchQueue(label: "state")   // 只做快速读写
     private let workQ = DispatchQueue(label: "work")     // 子进程 + 网络
+    private let credQ = DispatchQueue(label: "cred")     // 钥匙串修改时间检查（不排在 workQ 上：一次拉取最坏卡 60 秒）
     private var snaps: [AcctSnap]
     private var refreshing = false
+    private var credChecking = false
     private var lastAttempt = MONO_PAST
     private var lastForce = MONO_PAST                    // 手动刷新独立节流
     private var globalCooldown = MONO_PAST               // 任一账户 429 后的短全局冷却
@@ -330,6 +374,14 @@ final class UsageStore {
             // 调过时文件里可能存着几个月后的时刻，原样恢复就是永久静默冻结。
             if let nb = jsonNum(e["not_before"]), nb.isFinite {
                 snaps[i].notBefore = mono + min(max(0, nb - wall), BACKOFF_MAX)
+            }
+            // 凭据失败时刻也跨重启保留，否则重启后要干等退避走完。旧版 state.json 没这个键，
+            // 拿 attempt_at 顶上——它落盘时被夹到「最多 ACCT_MIN_GAP 前」，可能比真实失败时刻晚，
+            // 晚了只是错过这一次快速重拉、退回退避节奏，不会多打请求
+            if let err = snaps[i].error, CRED_ERRORS.contains(err),
+               let cf = jsonNum(e["cred_fail_at"]) ?? jsonNum(e["attempt_at"]),
+               cf.isFinite, abs(cf) < EPOCH_MAX {
+                snaps[i].credFailAt = cf
             }
         }
     }
@@ -423,7 +475,60 @@ final class UsageStore {
         workQ.async { self.doRefresh(targets, force: force) }
     }
 
-    private func doRefresh(_ idxs: [Int], force: Bool) {
+    // token 过期的账户不靠软退避干等。退避最长 1 小时，而这类失败在用户跑一次 claude 之后就好了：
+    // 2026-10-24 实测 B 闲置过夜后 token 过期，用户 21:23:55 点了立即刷新（还是旧 token，401，退避 1 小时），
+    // 21:24:03 Claude Code 才刷新 token——菜单栏要到 22:24 之后才肯再试，中间一直挂着陈旧的数字。
+    // 这里每轮只看钥匙串条目的修改时间：晚于失败那次读取，就是换了新 token，立刻重拉这几个账户。
+    // 不碰服务器给的 429 窗口和全局冷却；mdat 是本机写的，比当前时刻还晚（时钟被往回调过）就不认，
+    // 否则每轮都会判成「刚换过」，变成每分钟一个必定失败的请求。
+    func checkCredChange() {
+        var cands: [(idx: Int, service: String, failAt: Double)] = []
+        stateQ.sync {
+            if credChecking { return }
+            for i in snaps.indices { if let t = snaps[i].credFailAt { cands.append((i, snaps[i].cfg.keychain, t)) } }
+            if !cands.isEmpty { credChecking = true }
+        }
+        guard !cands.isEmpty else { return }
+        credQ.async {
+            let wall = Date().timeIntervalSince1970
+            // mdat 只到秒：同一秒里的重写也按「之后」算，宁可多试一次。试完 credFailAt 换成新的读取时刻，
+            // 下一轮就比不过了，不会循环
+            let changed = cands.filter { c in
+                guard let m = keychainMtime(c.service) else { return false }
+                return m >= c.failAt.rounded(.down) && m <= wall + 5
+            }
+            var targets: [Int] = []
+            self.stateQ.sync {
+                self.credChecking = false
+                let mono = monoNow()
+                if self.refreshing || mono < self.globalCooldown { return }   // 下一轮再看，条件还在
+                // 挑候选和读钥匙串之间状态可能变了（手动刷新刚拉成功、又失败了一次），只认还停在同一次失败上的
+                targets = changed.filter { self.snaps[$0.idx].credFailAt == $0.failAt && !self.snaps[$0.idx].rateLimited }.map { $0.idx }
+                guard let first = targets.first else { return }
+                self.refreshing = true
+                self.lastAttempt = mono
+                self.snaps[first].attemptAt = mono
+                // 和 attemptAt 一样，只认领第一个；后面的在 doRefresh 里真去拉之前才认领
+                self.claimCredRetry(first)
+            }
+            guard !targets.isEmpty else { return }
+            onMainCommon { self.onUpdate?() }
+            self.workQ.async { self.doRefresh(targets, force: false, credRetry: true) }
+        }
+    }
+
+    // 认领一次「钥匙串已重写」的重拉，调用方必须已在 stateQ 里。
+    // 新凭据 = 新起点：软退避清零，再失败就从 5 分钟重新爬。credFailAt 挪到现在（拉之前会落盘）：
+    // 拉到一半崩溃重启，不会拿着同一次重写再试——KeepAlive 崩溃循环下那就是每分钟一个请求。
+    // 必须在真去拉的那一刻才认领：一批里前一个吃了 429、后面的被跳过时，它们的标记要原样留着，
+    // 下一轮接着试；提前一起认领掉的话，它们只能等常规轮询（Codex 2026-10-24）
+    private func claimCredRetry(_ i: Int) {
+        snaps[i].backoff = 0
+        snaps[i].notBefore = MONO_PAST
+        snaps[i].credFailAt = Date().timeIntervalSince1970
+    }
+
+    private func doRefresh(_ idxs: [Int], force: Bool, credRetry: Bool = false) {
         // 串行，避免同瞬间双请求。每个账户一出结果就提交并回调，不憋到整批结束：
         // 单账户最坏 45s(钥匙串) + 15s(网络)，N 个账户就是 N 分钟界面纹丝不动。
         // refreshing 仍然覆盖整个循环，这是有意的——这段时间里进来的 tick 就该被吞掉，
@@ -434,16 +539,23 @@ final class UsageStore {
         saveState()
         for (n, i) in idxs.enumerated() {
             if n > 0 {
-                // 强刷一批拉多个账户：每拉下一个之前先看全局冷却——前一个刚吃了 429，这个端点正在拒人，
-                // 换个 token 也是撞同一堵墙，整批停下。不停才记 attemptAt，并照上面的理由先落盘再拉
+                // 一批拉多个账户（强刷，或钥匙串检查一次接住了好几个）：每拉下一个之前先看全局冷却——前一个刚吃了 429，
+                // 这个端点正在拒人，换个 token 也是撞同一堵墙，整批停下。不停才记 attemptAt（钥匙串重拉还要认领），
+                // 并照上面的理由先落盘再拉
                 var stop = false
                 stateQ.sync {
                     let m = monoNow()
-                    if m < globalCooldown { stop = true } else { snaps[i].attemptAt = m }
+                    if m < globalCooldown { stop = true } else {
+                        snaps[i].attemptAt = m
+                        if credRetry { claimCredRetry(i) }
+                    }
                 }
                 if stop { break }
                 saveState()
             }
+            // 在读钥匙串之前记：Claude Code 恰好在「读完旧 token」和「401 回来」之间换了新的，
+            // 修改时间也一定晚于它，下一轮钥匙串检查就能接住，不会漏
+            let readAt = Date().timeIntervalSince1970
             let r = Self.fetchAccount(ACCOUNTS[i])
             let mono = monoNow(), now = Date()
             stateQ.sync {
@@ -502,12 +614,14 @@ final class UsageStore {
                     }
                     snaps[i].rateLimited = server
                     snaps[i].notBefore = mono + snaps[i].backoff
+                    snaps[i].credFailAt = CRED_ERRORS.contains(err) ? readAt : nil
                 } else {
                     snaps[i].error = nil
                     snaps[i].backoff = 0
                     snaps[i].rateLimited = false
                     snaps[i].parseFails = 0
                     snaps[i].notBefore = MONO_PAST
+                    snaps[i].credFailAt = nil
                     snaps[i].weekly = r.weekly
                     snaps[i].fable = r.fable
                     // 5 小时桶不参与上面的「丢了就拒收」：它几小时就翻一轮，旧数字本来就没多少参考价值，
@@ -543,6 +657,7 @@ final class UsageStore {
                 // 重启之间时钟要是被往回调，它就成了一个未来时刻，白白把健康账户关进闸门。
                 // notBefore 是单调时钟，写盘时换算成墙钟绝对时刻。
                 if s.notBefore > mono { e["not_before"] = wall + (s.notBefore - mono) }
+                if let cf = s.credFailAt { e["cred_fail_at"] = cf }
                 if let at = s.dataAt {
                     e["at"] = at.timeIntervalSince1970
                     e["weekly"] = j(s.weekly?.dict)
@@ -1000,10 +1115,13 @@ class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 界面时钟和网络节奏彻底分开：倒计时、"✓"、环的满格都是随时间自己在变的，
         // 挂在 30 分钟的拉取定时器上，就会出现额度早已恢复而菜单栏还挂着 "15m" 的半小时空窗。
         every(RENDER_SEC, 5) { [weak self] in self?.render() }
+        every(CRED_WATCH_SEC, 10) { [weak self] in self?.store.checkCredChange() }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
         store.tick(staleGate: MENU_STALE_SEC)
+        // 刚跑完 claude 就来看菜单的，不必等下一轮钥匙串检查（tick 正在拉别的账户时这次会让给下一轮）
+        store.checkCredChange()
         render()
     }
 

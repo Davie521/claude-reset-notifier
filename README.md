@@ -84,6 +84,12 @@ a crash, and starts the app at login.
 - Failures back off per account: 5 → 10 → 20 … minutes, capped at 1 hour. A 429 takes the
   larger of that and the server's `Retry-After`, and adds a 60 second global cooldown. One
   account being rate-limited does not gate the other.
+- An account whose token has expired (or whose Keychain entry is missing) doesn't just
+  sit out its backoff. Once a minute the app checks that Keychain entry's modification
+  time — attributes only, no secret read, no request. If it is newer than the failed
+  attempt, Claude Code has written a fresh token, so the account is fetched right away.
+  Running `claude` therefore fixes the row within about a minute; opening the menu
+  checks too.
 - **Refresh now** respects the server's 429 window and the global cooldown — mashing it
   can't punch through — but does skip the soft backoff we added ourselves for local
   errors, so you can re-run `claude` to refresh a token and verify immediately. When a
@@ -252,7 +258,8 @@ docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:stable install.sh
 - macOS only, Apple silicon and Intel alike; no signing or notarisation, since you compile
   it yourself.
 - The app never refreshes tokens. When one expires, that row says so — run `claude` to
-  refresh, then hit "Refresh now".
+  refresh and the row recovers within about a minute (open the menu or hit "Refresh now"
+  if you don't want to wait).
 
 ## License
 
